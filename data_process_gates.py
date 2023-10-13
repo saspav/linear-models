@@ -162,7 +162,7 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
     out_user_id = [4, 51, 52]
     out_user_id = []
 
-    print(f'data_cls.out_user_id: len={len(out_user_id)} -> {out_user_id}')
+    # print(f'data_cls.out_user_id: len={len(out_user_id)} -> {out_user_id}')
 
     submit = pd.read_csv(file_submit_csv, index_col=0)
     submit['user_word'] = test_df['user_word'].astype('object')
@@ -231,7 +231,7 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
         uses_preds.update(pv_dict)
 
         # print(uses_preds)
-        print(sorted(pv_word), sorted(pv_dict.keys()), sep='\n')
+        # print(sorted(pv_word), sorted(pv_dict.keys()), sep='\n')
 
         prev_user_pred = user_pred
         # удалим из исходного ДФ найденные слова
@@ -249,11 +249,11 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
         user_pred = set(words['pred'].tolist())
         if prev_user_pred == user_pred:
             p_values = words[words.pred.gt(-9)].groupby('pred', as_index=False).p_value.max()
-            print('p_values по новому алгоритму:\n', p_values)
+            # print('p_values по новому алгоритму:\n', p_values)
             prev_user_pred = set()
 
-    print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
-    print(words)
+    # print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
+    # print(words)
 
     # Для неопределенных user_id
     no_user_id = words[words.pred == -999]
@@ -291,11 +291,11 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
         iteration += 1
         df_to_excel(words, file_dir.joinpath(f'words{iteration:02}.xlsx'), float_cells=[3])
 
-    print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
+    # print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
 
     new_words = {val[0]: key for key, val in uses_preds.items()}
     new_words = pd.DataFrame(sorted(new_words.items()), columns=['user_word', 'preds'])
-    print(new_words)
+    # print(new_words)
 
     new_words.to_csv(file_submit_csv.with_suffix('.words.tst_new.csv'), index=False)
     return words
@@ -360,10 +360,10 @@ def predict_test(idx_fold, model, datasets, max_num=0, submit_prefix='lg_', labe
     submit['target'] = predictions
     submit[['target']].to_csv(file_submit_csv)
 
-    print('submit:')
-    print(submit)
-    print('user_words:')
-    print(user_words)
+    # print('submit:')
+    # print(submit)
+    # print('user_words:')
+    # print(user_words)
 
     try:
         # формирование ответа
@@ -374,7 +374,8 @@ def predict_test(idx_fold, model, datasets, max_num=0, submit_prefix='lg_', labe
         )
         words.to_csv(file_submit_csv.with_suffix('.words.csv'), index=False)
 
-        find_predict_words_new(file_submit_csv, test_df, target.max())
+        find_predict_words(file_submit_csv, test_df, target.max())
+        # find_predict_words_new(file_submit_csv, test_df, target.max())
 
     except IndexError:
         print('Ошибка!!! Что-то пошло не так при формировании words.csv')
