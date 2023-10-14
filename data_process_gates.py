@@ -132,8 +132,88 @@ def find_predict_words(file_submit_csv, test_df, user_id_max=60):
 
     all_df = read_all_df(file_dir)
     data_cls = DataTransform2()
-    grp = data_cls.fit_days_mask(all_df, show_messages=False, remove_double_gate=True)
-    # TO DO
+    grp = data_cls.fit_days_mask(all_df, show_messages=False)
+    # пока зафиксируем эти user_id для удаления
+    # out_user_id = [4, 51, 52]
+    out_user_id = []
+
+    print(f'data_cls.out_user_id: len={len(out_user_id)} -> {out_user_id}')
+
+    submit = pd.read_csv(file_submit_csv, index_col=0)
+    submit['user_word'] = test_df['user_word'].astype('object')
+
+    words = submit.groupby('user_word', as_index=False).agg(
+        p_values=('target', lambda x: x.value_counts(normalize=True)
+                  .reset_index().values.tolist()))
+
+    # print(words)
+
+    words.insert(1, 'p_value', 0)
+    words.insert(1, 'pred', -999)
+    words['p_values'] = words['p_values'].map(
+        lambda x: [*map(lambda z: (int(z[0]), z[1]), x)])
+    words['p_dbl'] = words['p_values'].map(
+        lambda x: False if len(x) < 2 else x[0][1] == x[1][1])
+    words['p_values'] = words['p_values'].map(
+        lambda x: sorted(x, key=lambda k: (-k[1], k[0])))
+    words['pred'] = words['p_values'].map(lambda x: x[0][0]).astype(int)
+    words['p_value'] = words['p_values'].map(lambda x: x[0][1])
+    words['pred_old'] = words['pred']
+    words['p_values_old'] = words['p_values']
+
+    # words['p_values'] = words['p_values'].map(dict)
+    # print(words)
+
+    # df_to_excel(words, file_dir.joinpath('words.xlsx'), float_cells=[3])
+
+    uses_preds = dict()
+    for user_id in range(user_id_max + 1):
+        preds = words[words.pred == user_id]
+        if len(preds):
+            idx_max = preds.p_value.idxmax()
+            uses_preds[user_id] = words.at[idx_max, 'p_value']
+            for index, row in preds.iterrows():
+                p_values = row.p_values
+                if index == idx_max:
+                    p_values = p_values[:1]
+                else:
+                    p_values = [(k, v) for k, v in p_values[1:] if k not in uses_preds]
+                    if len(p_values) > 0:
+                        pred = p_values[0][0]
+                        p_value = p_values[0][1]
+                    else:
+                        pred = -999
+                        p_value = 0
+                    words.at[index, 'pred'] = pred
+                    words.at[index, 'p_value'] = p_value
+                words.at[index, 'p_values'] = p_values
+
+    # Для неопределенных user_id
+    no_user_id = words[words.pred == -999]
+    if len(no_user_id):
+        print(no_user_id)
+        for index, row in no_user_id.iterrows():
+            tmp = grp[grp.user_id == row.user_word]
+            print(tmp)
+            time_start = tmp.time_start.min() * 0.8
+            time_end = tmp.time_end.max() * 1.2
+            temp = grp[
+                # (grp['first_show'] > pd.to_datetime('2022-12-01').date()) &
+                (grp['date'] < pd.to_datetime('2023-01-01').date()) &
+                ~grp.user_id.isin(words.pred.unique()) &
+                (grp.time_start > time_start) & (grp.time_end < time_end)
+                ]
+            temp = temp.sort_values('first_show', ascending=False).reset_index(drop=True)
+            user_id = temp.at[0, 'user_id']
+            words.at[index, 'pred'] = user_id
+
+            print(temp)
+            df_to_excel(temp, file_dir.joinpath('grp.xlsx'))
+
+    df_to_excel(words, file_dir.joinpath('words.xlsx'), float_cells=[3])
+
+    words[['user_word', 'pred']].rename(columns={'pred': 'preds'}) \
+        .to_csv(file_submit_csv.with_suffix('.words.tst.csv'), index=False)
 
 
 def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
@@ -162,7 +242,7 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
     out_user_id = [4, 51, 52]
     out_user_id = []
 
-    # print(f'data_cls.out_user_id: len={len(out_user_id)} -> {out_user_id}')
+    print(f'data_cls.out_user_id: len={len(out_user_id)} -> {out_user_id}')
 
     submit = pd.read_csv(file_submit_csv, index_col=0)
     submit['user_word'] = test_df['user_word'].astype('object')
