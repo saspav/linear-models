@@ -22,6 +22,9 @@ GATES_DIR = Path(r'D:\python-datasets\gates-2')
 if not GATES_DIR.exists():
     GATES_DIR = Path('.')
     __file__ = Path('.')
+    LOCAL_FILE = ''
+else:
+    LOCAL_FILE = '_local'
 
 PREDICTIONS_DIR = GATES_DIR.joinpath('predictions')
 
@@ -57,7 +60,7 @@ def get_max_num(file_logs=None):
     :return: максимальный номер
     """
     if file_logs is None:
-        file_logs = GATES_DIR.joinpath('scores_local.logs')
+        file_logs = GATES_DIR.joinpath(f'scores{LOCAL_FILE}.logs')
 
     if not file_logs.is_file():
         with open(file_logs, mode='a') as log:
@@ -429,7 +432,7 @@ def predict_test(idx_fold, model, datasets, max_num=0, submit_prefix='lg_', labe
         predict_proba = model.predict_proba(test)
         train_proba = model.predict_proba(train)
 
-    submit_csv = f'{submit_prefix}submit_{max_num:03}{nfld}_local.csv'
+    submit_csv = f'{submit_prefix}submit_{max_num:03}{nfld}{LOCAL_FILE}.csv'
     file_submit_csv = PREDICTIONS_DIR.joinpath(submit_csv)
     file_proba_csv = PREDICTIONS_DIR.joinpath(submit_csv.replace('submit_', 'proba_'))
     file_train_csv = PREDICTIONS_DIR.joinpath(submit_csv.replace('submit_', 'train_'))
