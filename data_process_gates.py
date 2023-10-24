@@ -268,10 +268,10 @@ def find_predict_words(file_submit_csv, test_df, user_id_max=60):
     fill_no_user_id = True
     no_user_id = words[words.pred == -999]
     if fill_no_user_id and len(no_user_id):
-        print(no_user_id)
+        # print(no_user_id)
         for index, row in no_user_id.iterrows():
             tmp = grp[grp.user_id == row.user_word]
-            print(tmp)
+            # print(tmp)
             time_start = tmp.time_start.min() * 0.8
             time_end = tmp.time_end.max() * 1.2
             temp = grp[
@@ -284,7 +284,7 @@ def find_predict_words(file_submit_csv, test_df, user_id_max=60):
             user_id = temp.at[0, 'user_id']
             words.at[index, 'pred'] = user_id
 
-            print(temp)
+            # print(temp)
             df_to_excel(temp, file_dir.joinpath('grp.xlsx'))
 
     # words.at['y', 'pred'] = 13
@@ -351,10 +351,10 @@ def find_predict_words2(file_submit_csv, test_df, user_id_max=60):
     fill_no_user_id = False
     no_user_id = words[words.pred == -999]
     if fill_no_user_id and len(no_user_id):
-        print(no_user_id)
+        # print(no_user_id)
         for index, row in no_user_id.iterrows():
             tmp = grp[grp.user_id == row.user_word]
-            print(tmp)
+            # print(tmp)
             time_start = tmp.time_start.min() * 0.8
             time_end = tmp.time_end.max() * 1.2
             temp = grp[
@@ -367,7 +367,7 @@ def find_predict_words2(file_submit_csv, test_df, user_id_max=60):
             user_id = temp.at[0, 'user_id']
             words.at[index, 'pred'] = user_id
 
-            print(temp)
+            # print(temp)
             df_to_excel(temp, file_dir.joinpath('grp.xlsx'))
 
     wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
