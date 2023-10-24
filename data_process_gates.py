@@ -6,6 +6,7 @@ from tqdm import tqdm
 from collections import Counter
 from df_addons import df_to_excel
 
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.preprocessing import LabelEncoder
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures, OneHotEncoder
 from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
@@ -122,6 +123,98 @@ def predict_train_valid(model, datasets, label_enc=None):
     return acc_train, acc_valid, acc_full, roc_auc, f1w
 
 
+def prepare_df_words(file_submit_csv, test_df, out_user_id=[]):
+    """
+    Формирование ДФ words
+    :param file_submit_csv: имя файл сабмита с предсказанными user_id
+    :param test_df: тестовый ДФ
+    :param out_user_id: список user_id, которых надо исключить
+                        или 'auto' - для автоматического формирования
+    :return: words
+    """
+    file_dir = Path(__file__).parent
+
+    all_df = read_all_df(file_dir)
+    data_cls = DataTransform2()
+    grp = data_cls.fit_days_mask(all_df, show_messages=False, remove_double_gate=True,
+                                 drop_december=True)
+    if out_user_id == 'auto':
+        if data_cls.out_user_id is None:
+            out_user_id = [4, 51, 52]
+        else:
+            out_user_id = data_cls.out_user_id
+
+        # пока зафиксируем эти user_id для удаления
+        # out_user_id = [4, 51, 52]
+        # out_user_id = []
+
+    print(f'data_cls.out_user_id: len={len(out_user_id)} -> {out_user_id}')
+
+    submit = pd.read_csv(file_submit_csv, index_col=0)
+    submit['user_word'] = test_df['user_word'].astype('object')
+
+    # print(submit)
+    # print(test_df['user_word'])
+    # print('user_id_max:', user_id_max)
+
+    # print('out_user_id == target')
+    # print(submit[submit['target'].isin(out_user_id)].target.value_counts())
+    # print(submit[submit['target'].isin(out_user_id)].user_word.value_counts())
+
+    # без user_id, которых не было в декабре
+    words = submit[~submit.target.isin(out_user_id)] \
+        .groupby('user_word', as_index=False) \
+        .agg(p_values=('target', lambda x: x.value_counts(normalize=True)
+                       .reset_index().values.tolist()),
+             p_counts=('target', lambda x: x.value_counts()
+                       .reset_index().values.tolist()),
+             total=('target', 'count'))
+    # Заменяем колонку в датафрейме объединенными данными
+    words['p_values'] = words.apply(lambda row: [(x, y, z) for (x, y), (_, z)
+                                                 in zip(row['p_values'], row['p_counts'])],
+                                    axis='columns')
+    words.drop('p_counts', axis='columns', inplace=True)
+    words.insert(1, 'prd_v_c', 0)
+    words.insert(1, 'p_count', 0)
+    words.insert(1, 'p_value', 0)
+    words.insert(1, 'pred', -999)
+    # value_counts выдал в виде кортежа ('user_id', 'p_value'), user_id преобразуем в int
+    words['p_values'] = words['p_values'].map(
+        lambda x: [*map(lambda z: (int(z[0]),) + z[1:], x)])
+    words['p_values'] = words['p_values'].map(
+        lambda x: sorted(x, key=lambda k: (-k[1], k[0])))
+    # сортируем кортежи в порядке убывания p_value и возрастанию user_id
+    # выделим в отдельную колонку первый pred user_id
+    words['pred'] = words['p_values'].map(lambda x: x[0][0]).astype(int)
+    # выделим в отдельную колонку первое p_value
+    words['p_value'] = words['p_values'].map(lambda x: x[0][1])
+    # выделим в отдельную колонку первое p_value
+    words['p_count'] = words['p_values'].map(lambda x: x[0][2]).astype(int)
+    words['prd_v_c'] = words['p_value'] * words['p_count']
+    # сохраним для истории эти значения, т.к. дальше будем их затирать
+    words['pred_old'] = words['pred']
+    words['p_values_old'] = words['p_values']
+
+    # это заглушка для двух отсутствующих в трейне юзеров 13 и 16
+    for word in ('regression', 'y'):
+        words.loc[words.user_word.eq(word),
+                  ['pred', 'p_value', 'p_count', 'prd_v_c', 'total']] = [-999, 0, 0, 0, 0]
+    words['p_values'] = words.apply(lambda row: [] if row.pred < 0 else row.p_values, axis=1)
+
+    # преобразуем в ДФ максимальные p_value для каждого user_id
+    p_values = sum(words['p_values'].tolist(), [])
+    p_values = pd.DataFrame(p_values, columns=['pred', 'p_value', 'total'])
+    p_values = p_values.groupby('pred', as_index=False).p_value.max() \
+        .sort_values('p_value', ascending=False)
+
+    df_to_excel(p_values, file_dir.joinpath('p_values.xlsx'), float_cells=[2])
+    # print(words)
+    wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
+    df_to_excel(words, file_dir.joinpath('words.xlsx'), float_cells=[3, 5], ins_col_width=wd)
+
+    return words, grp, p_values
+
+
 def find_predict_words(file_submit_csv, test_df, user_id_max=60):
     """
     Процедура формирования предсказания user_id на основа самого частотного во всей массе
@@ -133,54 +226,34 @@ def find_predict_words(file_submit_csv, test_df, user_id_max=60):
     """
     file_dir = Path(__file__).parent
 
-    all_df = read_all_df(file_dir)
-    data_cls = DataTransform2()
-    grp = data_cls.fit_days_mask(all_df, show_messages=False)
-    # пока зафиксируем эти user_id для удаления
-    # out_user_id = [4, 51, 52]
     out_user_id = []
+    # пока зафиксируем эти user_id для удаления
+    # out_user_id = [5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 57]
+    # out_user_id = [4, 5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 52, 57]
+    out_user_id = [4, 51, 52]
+    # out_user_id = [4, 51]
 
-    print(f'data_cls.out_user_id: len={len(out_user_id)} -> {out_user_id}')
+    words, grp, p_values = prepare_df_words(file_submit_csv, test_df,
+                                            out_user_id=out_user_id)
 
-    submit = pd.read_csv(file_submit_csv, index_col=0)
-    submit['user_word'] = test_df['user_word'].astype('object')
-
-    words = submit.groupby('user_word', as_index=False).agg(
-        p_values=('target', lambda x: x.value_counts(normalize=True)
-                  .reset_index().values.tolist()))
-
-    # print(words)
-
-    words.insert(1, 'p_value', 0)
-    words.insert(1, 'pred', -999)
-    words['p_values'] = words['p_values'].map(
-        lambda x: [*map(lambda z: (int(z[0]), z[1]), x)])
-    words['p_dbl'] = words['p_values'].map(
-        lambda x: False if len(x) < 2 else x[0][1] == x[1][1])
-    words['p_values'] = words['p_values'].map(
-        lambda x: sorted(x, key=lambda k: (-k[1], k[0])))
-    words['pred'] = words['p_values'].map(lambda x: x[0][0]).astype(int)
-    words['p_value'] = words['p_values'].map(lambda x: x[0][1])
-    words['pred_old'] = words['pred']
-    words['p_values_old'] = words['p_values']
-
-    # words['p_values'] = words['p_values'].map(dict)
-    # print(words)
-
-    # df_to_excel(words, file_dir.joinpath('words.xlsx'), float_cells=[3])
-
+    p_value_limit = 0.02
     uses_preds = dict()
     for user_id in range(user_id_max + 1):
         preds = words[words.pred == user_id]
         if len(preds):
             idx_max = preds.p_value.idxmax()
-            uses_preds[user_id] = words.at[idx_max, 'p_value']
+            # print(f'user_id: {user_id} idx_max={idx_max} '
+            #       f'p_value={words.at[idx_max, "p_value"]}')
+            if words.at[idx_max, 'p_value'] > p_value_limit:
+                uses_preds[user_id] = words.at[idx_max, 'p_value']
+            else:
+                uses_preds[user_id] = -999
             for index, row in preds.iterrows():
                 p_values = row.p_values
                 if index == idx_max:
                     p_values = p_values[:1]
                 else:
-                    p_values = [(k, v) for k, v in p_values[1:] if k not in uses_preds]
+                    p_values = [(k, *v) for k, *v in p_values[1:] if k not in uses_preds]
                     if len(p_values) > 0:
                         pred = p_values[0][0]
                         p_value = p_values[0][1]
@@ -192,8 +265,9 @@ def find_predict_words(file_submit_csv, test_df, user_id_max=60):
                 words.at[index, 'p_values'] = p_values
 
     # Для неопределенных user_id
+    fill_no_user_id = True
     no_user_id = words[words.pred == -999]
-    if len(no_user_id):
+    if fill_no_user_id and len(no_user_id):
         print(no_user_id)
         for index, row in no_user_id.iterrows():
             tmp = grp[grp.user_id == row.user_word]
@@ -213,10 +287,95 @@ def find_predict_words(file_submit_csv, test_df, user_id_max=60):
             print(temp)
             df_to_excel(temp, file_dir.joinpath('grp.xlsx'))
 
-    df_to_excel(words, file_dir.joinpath('words.xlsx'), float_cells=[3])
+    # words.at['y', 'pred'] = 13
+    # words.at['regression', 'pred'] = 16
+
+    wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
+    df_to_excel(words, file_dir.joinpath('words.tst.xlsx'), float_cells=[3, 5],
+                ins_col_width=wd)
 
     words[['user_word', 'pred']].rename(columns={'pred': 'preds'}) \
         .to_csv(file_submit_csv.with_suffix('.words.tst.csv'), index=False)
+
+
+def find_predict_words2(file_submit_csv, test_df, user_id_max=60):
+    """
+    Процедура формирования предсказания user_id на основа самого частотного во всей массе
+    предсказаний и охранение в файл xxx.tst.csv
+    :param file_submit_csv: имя файл сабмита с предсказанными user_id
+    :param test_df: тестовый ДФ
+    :param user_id_max: максимальный номер user_id из трейна
+    :return: новый сабмит с user_word
+    """
+    file_dir = Path(__file__).parent
+
+    out_user_id = []
+    out_user_id = 'auto'
+    # пока зафиксируем эти user_id для удаления
+    # out_user_id = [5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 57]
+    # out_user_id = [4, 51, 52]
+    # out_user_id = [4, 51]
+
+    words, grp, p_values = prepare_df_words(file_submit_csv, test_df,
+                                            out_user_id=out_user_id)
+
+    p_value_limit = .0
+    uses_preds = dict()
+    for user_id in p_values['pred']:
+        preds = words[words.pred == user_id]
+        if len(preds):
+            idx_max = preds.p_value.idxmax()
+            # print(f'user_id: {user_id} idx_max={idx_max} '
+            #       f'p_value={words.at[idx_max, "p_value"]}')
+            if words.at[idx_max, 'p_value'] > p_value_limit:
+                uses_preds[user_id] = words.at[idx_max, 'p_value']
+            else:
+                uses_preds[user_id] = -999
+            for index, row in preds.iterrows():
+                p_values = row.p_values
+                if index == idx_max:
+                    p_values = p_values[:1]
+                else:
+                    p_values = [(k, *v) for k, *v in p_values[1:] if k not in uses_preds]
+                    if len(p_values) > 0:
+                        pred = p_values[0][0]
+                        p_value = p_values[0][1]
+                    else:
+                        pred = -999
+                        p_value = 0
+                    words.at[index, 'pred'] = pred
+                    words.at[index, 'p_value'] = p_value
+                words.at[index, 'p_values'] = p_values
+
+    # Для неопределенных user_id
+    fill_no_user_id = False
+    no_user_id = words[words.pred == -999]
+    if fill_no_user_id and len(no_user_id):
+        print(no_user_id)
+        for index, row in no_user_id.iterrows():
+            tmp = grp[grp.user_id == row.user_word]
+            print(tmp)
+            time_start = tmp.time_start.min() * 0.8
+            time_end = tmp.time_end.max() * 1.2
+            temp = grp[
+                # (grp['first_show'] > pd.to_datetime('2022-12-01').date()) &
+                (grp['date'] < pd.to_datetime('2023-01-01').date()) &
+                ~grp.user_id.isin(words.pred.unique()) &
+                (grp.time_start > time_start) & (grp.time_end < time_end)
+                ]
+            temp = temp.sort_values('first_show', ascending=False).reset_index(drop=True)
+            user_id = temp.at[0, 'user_id']
+            words.at[index, 'pred'] = user_id
+
+            print(temp)
+            df_to_excel(temp, file_dir.joinpath('grp.xlsx'))
+
+    wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
+    df_to_excel(words, file_dir.joinpath('words.tst2.xlsx'), float_cells=[3, 5],
+                ins_col_width=wd)
+
+    words[['user_word', 'pred']].rename(columns={'pred': 'preds'}) \
+        .to_csv(file_submit_csv.with_suffix('.words.tst2.csv'), index=False)
 
 
 def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
@@ -231,72 +390,19 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
     """
     file_dir = Path(__file__).parent
 
-    all_df = read_all_df(file_dir)
-    data_cls = DataTransform2()
-    grp = data_cls.fit_days_mask(all_df, show_messages=False, remove_double_gate=True,
-                                 drop_december=True)
-
-    if data_cls.out_user_id is None:
-        out_user_id = [4, 51, 52]
-    else:
-        out_user_id = data_cls.out_user_id
-
+    out_user_id = 'auto'
     # пока зафиксируем эти user_id для удаления
-    out_user_id = [4, 51, 52]
-    out_user_id = []
+    # out_user_id = [5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 57]
+    # out_user_id = [4, 51, 52]
 
-    print(f'data_cls.out_user_id: len={len(out_user_id)} -> {out_user_id}')
-
-    submit = pd.read_csv(file_submit_csv, index_col=0)
-    submit['user_word'] = test_df['user_word'].astype('object')
-
-    # print(submit)
-    # print(test_df['user_word'])
-    # print('user_id_max:', user_id_max)
-
-    # print('out_user_id == target')
-    # print(submit[submit['target'].isin(out_user_id)].target.value_counts())
-    # print(submit[submit['target'].isin(out_user_id)].user_word.value_counts())
-
-    # без user_id, которых не было в декабре
-    words = submit[~submit.target.isin(out_user_id)] \
-        .groupby('user_word', as_index=False) \
-        .agg(p_values=('target', lambda x: x.value_counts(normalize=True)
-                       .reset_index().values.tolist()))
-    words.insert(1, 'p_value', 0)
-    words.insert(1, 'pred', -999)
-    # value_counts выдал в виде кортежа ('user_id', 'p_value'), user_id преобразуем в int
-    words['p_values'] = words['p_values'].map(
-        lambda x: [*map(lambda z: (int(z[0]), z[1]), x)])
-    words['p_values'] = words['p_values'].map(
-        lambda x: sorted(x, key=lambda k: (-k[1], k[0])))
-    # сортируем кортежи в порядке убывания p_value и возрастанию user_id
-    words['p_dbl'] = words['p_values'].map(
-        lambda x: False if len(x) < 2 else x[0][1] == x[1][1])
-    # выделим в отдельную колонку первый pred user_id
-    words['pred'] = words['p_values'].map(lambda x: x[0][0]).astype(int)
-    # выделим в отдельную колонку первое p_value
-    words['p_value'] = words['p_values'].map(lambda x: x[0][1])
-    # сохраним для истории эти значения, т.к. дальше будем их затирать
-    words['pred_old'] = words['pred']
-    words['p_values_old'] = words['p_values']
-
-    # преобразуем в ДФ максимальные p_value для каждого user_id
-    p_values = sum(words['p_values'].tolist(), [])
-    p_values = pd.DataFrame(p_values, columns=['pred', 'p_value'])
-    p_values = p_values.groupby('pred', as_index=False).p_value.max() \
-        .sort_values('p_value', ascending=False)
-
-    df_to_excel(p_values, file_dir.joinpath('p_values.xlsx'), float_cells=[2])
-    # print(words)
-    df_to_excel(words, file_dir.joinpath('words.xlsx'), float_cells=[3])
-
-    copy_words = words.copy()
+    words, grp, p_values = prepare_df_words(file_submit_csv, test_df,
+                                            out_user_id=out_user_id)
 
     uses_preds = {}  # словарь для хранения обработанных user_id для user_word
     iteration = 0  # порядковый номер итерации
     user_pred = set(words['pred'].tolist())
     prev_user_pred = set()
+    df_pv_iter = pd.DataFrame()
     while len(user_pred) and len(p_values) and prev_user_pred != user_pred:
         iteration += 1
         df_pv = p_values.merge(words[['user_word', 'pred', 'p_value']],
@@ -305,6 +411,10 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
 
         # запишем в ДФ найденные user_id для user_word
         pv = df_pv.dropna()
+        pv.insert(0, 'iteration', iteration)
+        df_pv_iter = pd.concat([df_pv_iter, pv.sort_values('user_word')])
+        df_to_excel(pv.sort_values('user_word'),
+                    file_dir.joinpath(f'pv{iteration:02}.xlsx'), float_cells=[3])
         # преобразуем ДФ в словарь
         pv_dict = {row['pred']: (row['user_word'], row['p_value']) for _, row in
                    pv.iterrows()}
@@ -321,26 +431,30 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
         words = words[~words.user_word.isin(pv_word)]
         # удалим из списка вероятностей те user_id, которые уже обработаны, есть в uses_preds
         words['p_values'] = words['p_values'].apply(
-            lambda x: [(k, v) for k, v in x if k not in uses_preds])
+            lambda x: [(k, *v) for k, *v in x if k not in uses_preds])
         # запишем в 'pred' следующий user_id по порядку, если список пуст -> -999
         words['pred'] = words['p_values'].apply(lambda x: x[0][0] if len(x) > 0 else -999)
         # запишем в 'pred' следующую вероятность по порядку, если список пуст -> 0
         words['p_value'] = words['p_values'].apply(lambda x: x[0][1] if len(x) > 0 else 0)
         # теперь надо повторить действия с "запишем в ДФ найденные user_id для user_word"
 
-        df_to_excel(words, file_dir.joinpath(f'words{iteration:02}.xlsx'), float_cells=[3])
+        wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
+        df_to_excel(words, file_dir.joinpath(f'words{iteration:02}.xlsx'),
+                    float_cells=[3, 5], ins_col_width=wd)
         user_pred = set(words['pred'].tolist())
         if prev_user_pred == user_pred:
             p_values = words[words.pred.gt(-9)].groupby('pred', as_index=False).p_value.max()
             # print('p_values по новому алгоритму:\n', p_values)
             prev_user_pred = set()
 
+    df_to_excel(df_pv_iter, file_dir.joinpath('df_pv_iter.xlsx'), float_cells=[3])
     # print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
     # print(words)
 
     # Для неопределенных user_id
+    fill_no_user_id = False
     no_user_id = words[words.pred == -999]
-    if len(no_user_id):
+    if fill_no_user_id and len(no_user_id):
         print('no_user_id:\n', no_user_id)
         for index, row in no_user_id.iterrows():
             tmp = grp[grp.user_id == row.user_word]
@@ -372,13 +486,20 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
             df_to_excel(temp, file_dir.joinpath('grp.xlsx'))
 
         iteration += 1
-        df_to_excel(words, file_dir.joinpath(f'words{iteration:02}.xlsx'), float_cells=[3])
+        wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
+        df_to_excel(words, file_dir.joinpath(f'words{iteration:02}.xlsx'),
+                    float_cells=[3, 5], ins_col_width=wd)
 
     # print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
 
     new_words = {val[0]: key for key, val in uses_preds.items()}
     new_words = pd.DataFrame(sorted(new_words.items()), columns=['user_word', 'preds'])
     # print(new_words)
+
+    if not fill_no_user_id and len(no_user_id):
+        no_user_id = no_user_id.rename(columns={'pred': 'preds'})
+        new_words = pd.concat([new_words, no_user_id[['user_word', 'preds']]])
+        new_words.sort_values('user_word', inplace=True)
 
     new_words.to_csv(file_submit_csv.with_suffix('.words.tst_new.csv'), index=False)
     return words
@@ -401,6 +522,10 @@ def predict_test(idx_fold, model, datasets, max_num=0, submit_prefix='lg_', labe
     X_train, X_valid, y_train, y_valid, train, target, test_df = datasets
 
     test = test_df.copy()
+
+    print('X_train.shape', X_train.shape)
+    print('train.shape', train.shape)
+    print('test.shape', test.shape)
 
     # выделим колонку с user_word
     if 'user_word' in test.columns:
@@ -491,7 +616,7 @@ def predict_test(idx_fold, model, datasets, max_num=0, submit_prefix='lg_', labe
 
 class DataTransform:
     def __init__(self, use_catboost=False, numeric_columns=None, category_columns=None,
-                 drop_first=False, scaler=None, args_scaler=None):
+                 drop_first=False, scaler=None, args_scaler=None, **kwargs):
         """
         Преобразование данных
         :param use_catboost: данные готовятся для catboost
@@ -501,6 +626,7 @@ class DataTransform:
         :param scaler: какой скейлер будем использовать
         :param degree: аргументы для скейлера, например: степень для полином.преобразования
         """
+        self.file_dir = Path(kwargs.get('file_dir', Path(__file__).parent))
         self.use_catboost = use_catboost
         self.category_columns = [] if category_columns is None else category_columns
         self.numeric_columns = [] if numeric_columns is None else numeric_columns
@@ -575,16 +701,44 @@ class DataTransform:
                            (13, 13, 12, 12), (13, 13, 12, 12, 11), (15, 3, 3),
                            (15, 3, 3, 10), (15, 3, 3, 10, 11), (15, 9, 9), (15, 9, 9, 5, 5),
                            ]
+        self.fit_df = None
+        self.make_patterns_on_full_dataset = False
         self.gates_mask_count_2_4 = None
         self.gates_mask_count_ge5 = None
+        # максимальная последовательность турникетов для обработки
+        # (в этом классе не используется -> используется у наследниках)
+        self.max_gates_len = 18
+        # максимальная последовательность турникетов для векторизации
+        self.vector_limit = 20
+        # векторизатор
+        self.vectorizer = CountVectorizer
+        # диапазон N-грамм
+        self.ngram_range = (1, 2)
+        # Минимальное количество последовательностей для векторизации
+        self.min_df = 1
+        # Максимальное количество признаков
+        self.max_features = None
+        # По какому полю группировать данные перед векторизацией,
+        # иначе на уже сгруппированных данных
+        self.group_before_vectorizer = None
 
-    def initial_preparation(self, df, out_five_percent=False):
+    @staticmethod
+    def remove_doubles(list_gates):
+        res = [list_gates[i] for i in range(len(list_gates))
+               if i == 0 or list_gates[i] != list_gates[i - 1]]
+        return tuple(res)
+
+    def initial_preparation(self, df, out_five_percent=False, drop_outlet_weeks=False):
         """
         Общая первоначальная подготовка данных
         :param df: исходный ДФ
         :param out_five_percent: граница 5% при определении выбросов
+        :param drop_outlet_weeks: удалить из данных недели с выбросами
         :return: обработанный ДФ
         """
+        if 'ts' not in df.columns:
+            df.rename(columns={'timestamp': 'ts'}, inplace=True)
+
         df["date"] = df['ts'].dt.date
         df["time"] = df['ts'].dt.time
         df["day"] = df['ts'].dt.day
@@ -602,25 +756,37 @@ class DataTransform:
         df["1day"] = df['ts'].dt.is_month_start.astype(int)
         # 2-й день месяца
         df["2day"] = (df.day == 2).astype(int)
-        # предпоследний день месяца
+        # Предпоследний день месяца
         df["last_day-1"] = (df.day == df.ts.dt.daysinmonth - 1).astype(int)
         # Последний день месяца
         df["last_day"] = df['ts'].dt.is_month_end.astype(int)
 
         df["weekday"] = df['ts'].dt.dayofweek  # День недели от 0 до 6
-        df["dayofweek"] = df["weekday"] + 1  # День недели от 1 до 7
 
         # Метка выходного дня
         df["is_weekend"] = df["weekday"].map(lambda x: 1 if x in (5, 6) else 0)
 
-        # метки "график 2 через 2"
+        # Метки "график 2 через 2"
         df["DofY1"] = (df['ts'].dt.dayofyear % 4).apply(lambda x: int(x in (1, 2)))
         df["DofY2"] = (df['ts'].dt.dayofyear % 4).apply(lambda x: int(x < 2))
 
+        # толку от этого нет
         # df['morning'] = df['hour'].map(lambda x: 1 if 6 <= x <= 10 else 0)
         # df['daytime'] = df['hour'].map(lambda x: 1 if 11 <= x <= 17 else 0)
         # df['evening'] = df['hour'].map(lambda x: 1 if 18 <= x <= 22 else 0)
         # df['night'] = df['hour'].map(lambda x: 1 if 0 <= x <= 5 or x == 23 else 0)
+
+        # заполнение колонки user_word на трейне значением user_id
+        idx_isna_words = df['user_word'].isna()
+        df.loc[idx_isna_words, 'user_word'] = df.loc[idx_isna_words, 'user_id']
+
+        if drop_outlet_weeks:
+            # удаление дубликатов
+            df.drop_duplicates(['ts', 'gate_id', 'user_word'], inplace=True)
+            # подсчет количества посещений по неделям
+            grp_week = df.groupby(['week'], as_index=False).agg(counts=('ts', 'count'))
+            out_weeks = grp_week[grp_week.counts < 777].week.tolist()
+            df = df[~df['week'].isin(out_weeks)]
 
         # Подсчет количества срабатываний за день
         df["beep_count"] = df.groupby("date").ts.transform("count")
@@ -703,10 +869,12 @@ class DataTransform:
             self.comment.update(scaler=self.scaler.__name__, args_scaler=self.args_scaler)
         return df
 
-    def fit_gate_times(self, df, remake_gates_mask=False, use_gates_mask_V2=False):
+    def fit_gate_times(self, df, all_df=None, remake_gates_mask=False,
+                       use_gates_mask_V2=False):
         """
         Получение паттернов прохода через турникеты
         :param df: тренировочный ДФ
+        :param all_df: объединенный ДФ
         :param remake_gates_mask: получить шаблоны масок из трейна, иначе взять из класса
         :param use_gates_mask_V2: использовать расширенный набор масок из класса
         :return: ДФ с паттернами
@@ -832,7 +1000,7 @@ class DataTransform:
         for idx, sub_gates in enumerate(zip(*[gates[i:] for i in range(len(mask))])):
             # найден паттерн турникетов
             if sub_gates == mask:
-                # если есть проверка по дельта времени прохода --> смотрим,
+                # если есть проверка по дельте времени прохода --> смотрим,
                 # чтобы дельта попадала в границы диапазона обученных паттернов
                 if times is None or (
                         times and all(times[i][0] <= gates_times[idx + i] <= times[i][1]
@@ -845,32 +1013,40 @@ class DataTransform:
                 print('times, gates_times:', times, gates_times)
         return index_mask >= 0
 
+    def drop_outlets_user_gate(self, df):
+        if 'gate_id' in df.columns:
+            outlet_user_gate = df.user_id.isin([4, 51]) | df.gate_id.isin([0, 16])
+            self.comment.update(drop_users='4,51', drop_gates='0,16')
+        else:
+            outlet_user_gate = df.user_id.isin([4, 51])
+            self.comment.update(drop_users='4,51')
+        return df
+
     def fit(self, df, file_df=None, out_five_percent=False, remake_gates_mask=False,
-            drop_december=False):
+            use_gates_mask_V2=False, drop_december=False, drop_outlets=False,
+            drop_outlet_weeks=False):
         """
         Формирование фич --> очень временнозатратная операция ~2 часа
         :param df: исходный ФД
         :param file_df: Предобработанный Файл .pkl с полным путём
         :param out_five_percent: граница 5% при определении выбросов
         :param remake_gates_mask: получить шаблоны масок из трейна, иначе взять из класса
+        :param use_gates_mask_V2: использовать расширенный набор масок из класса
         :param drop_december: удалить тех, кто в декабре не появлялся
+        :param drop_outlets: удалить редких юзеров и гейты
+        :param drop_outlet_weeks: удалить из данных недели с выбросами
         :return: обработанный ДФ
         """
         if file_df and file_df.suffix == '.pkl' and file_df.is_file():
             df = pd.read_pickle(file_df)
+            if drop_outlets:
+                df = self.drop_outlets_user_gate(df)
             return df
 
-        df = self.initial_preparation(df, out_five_percent=out_five_percent)
-
-        # # эту секцию перенес в self.initial_preparation
-        # # данные для устранения выбросов, где рабочий день помечен как выходной и наоборот
-        # tmp = df[['date', 'weekday', 'beep_count', 'is_weekend']].drop_duplicates()
-        # tmp["weekend"] = tmp["weekday"].map(lambda x: 1 if x in (5, 6) else 0)
-        # beep_cnt = tmp[tmp["weekend"] == 1].beep_count
-        # if out_five_percent:
-        #     self.beep_outlet = beep_cnt.quantile(0.975)  # 69.75
-        # else:
-        #     self.beep_outlet = beep_cnt.quantile(0.75) + beep_cnt.std() * 1.5  # 98.7
+        df = self.initial_preparation(df, out_five_percent=out_five_percent,
+                                      drop_outlet_weeks=drop_outlet_weeks)
+        if drop_outlets:
+            df = self.drop_outlets_user_gate(df)
 
         # выделил shift по датам, чтобы случайно не зацепить переход между сутками
         result = pd.DataFrame()
@@ -904,59 +1080,184 @@ class DataTransform:
 
         if remake_gates_mask:
             # получим паттерны
-            tmp_columns = ['user_id', 'ts', 'gate_id']
-            train_tmp = df[df.user_id > -1][tmp_columns]
-            self.fit_gate_times(train_tmp, remake_gates_mask=True)
+            if self.make_patterns_on_full_dataset:
+                tmp_columns = ['user_id', 'ts', 'gate_id', 'user_word']
+                tm = df[tmp_columns]
+                # присвоение отсутствующим user_id из теста закодированных слов
+                tm.loc[tm['user_id'] < 0, 'user_id'] = tm.loc[tm['user_id'] < 0, 'user_word']
+                train_tmp = tm
+            else:
+                tmp_columns = ['user_id', 'ts', 'gate_id']
+                train_tmp = df[df.user_id > -1][tmp_columns]
+
+            self.fit_gate_times(train_tmp, df, remake_gates_mask=True,
+                                use_gates_mask_V2=use_gates_mask_V2)
             print('Количество паттернов:', len(self.gates_mask))
+            if self.fit_df is not None:
+                df = self.fit_df
 
-        start_time = print_msg('Поиск по шаблонам...')
+        # print(self.gates_mask)
 
-        tqdm.pandas()
-        for mask in self.gates_mask:
-            times = None
-            if len(mask) == 2:
-                mask, times = mask
-            mask_col = 'G' + '_'.join(map(str, mask))
-            print(f'Шаблон: {mask} колонка: {mask_col}')
-            df[mask_col] = df.progress_apply(
-                lambda row: self.find_gates(row, mask, times=times), axis=1).astype(int)
+        # Если есть подготовленный ДФ на этапе self.fit_gate_times -> там это уже сделано
+        if self.fit_df is None:
+
+            start_time = print_msg('Поиск по шаблонам...')
+
+            tqdm.pandas()
+            for mask in self.gates_mask:
+                times = None
+                if len(mask) == 2 and isinstance(mask[0], (list, tuple)):
+                    mask, times = mask
+                mask_col = 'G' + '_'.join(map(str, mask))
+                print(f'Шаблон: {mask} колонка: {mask_col}')
+                df[mask_col] = df.progress_apply(
+                    lambda row: self.find_gates(row, mask, times=times), axis=1).astype(int)
+
+            print_time(start_time)
 
         if self.preprocess_path_file:
             df.to_pickle(self.preprocess_path_file)
             df.to_csv(self.preprocess_path_file.with_suffix('.csv'))
 
-        print_time(start_time)
         return df
 
-    def transform(self, df, model_columns=None, out_five_percent=False, drop_december=False):
+    def vectorizer_gates(self, df, gates_column, group_columns=None):
+        """
+        Векторизация турникетов за один день по group_columns
+        или за один день по одному user_word если group_columns=None
+        :param df: исходный ДФ
+        :param gates_column: колонка с кортежем турникетов для векторизации
+        :param group_columns: список колонок для группировки
+        :return:
+        """
+        if group_columns is None:
+            grp = df
+        else:
+            grp = df.groupby(group_columns, as_index=False).agg(
+                list_gates_full=('gate_id', tuple),
+            )
+            gates_column = 'list_gates_full'
+
+        # максимальная длина последовательности турникетов
+        max_gc = grp[gates_column].map(len).max()
+        if self.vector_limit:
+            max_gc = min(self.vector_limit, max_gc)
+
+        print(f'Векторизация последовательности из {max_gc} турникетов')
+        grp['vectorizer'] = grp[gates_column].map(
+            lambda gts: ' '.join(f'GT{x:02}'.replace('-', 'Z') for x in gts[:max_gc]))
+        bigram_vectorizer = self.vectorizer(ngram_range=self.ngram_range,
+                                            min_df=self.min_df,
+                                            max_features=self.max_features)
+        bigram = bigram_vectorizer.fit_transform(grp['vectorizer'].tolist()).toarray()
+        print(f'Векторизация породила: {bigram.shape[1]} колонок')
+        vct_columns = [f'vct_{n:03}' for n in range(bigram.shape[1])]
+        grp = pd.concat([grp, pd.DataFrame(bigram, columns=vct_columns)], axis=1)
+        self.comment.update(vectorizer=self.vectorizer, ngram_range=self.ngram_range,
+                            min_df=self.min_df, max_features=self.max_features,
+                            vector_limit=max_gc)
+        self.numeric_columns.extend(vct_columns)
+        self.exclude_columns.append('vectorizer')
+        if group_columns is None:
+            return grp
+        else:
+            df = df.merge(grp, on=group_columns, how='left')
+            return df
+
+    def transform(self, df, model_columns=None, out_five_percent=False, drop_december=False,
+                  replace_gates_full_vector=False):
         """
         Формирование остальных фич
         :param df: ДФ
         :param model_columns: список колонок, которые будут использованы в модели
         :param out_five_percent: граница 5% при определении выбросов
         :param drop_december: удалить тех, кто в декабре не появлялся
+        :param replace_gates_full_vector: заменить полную последовательность турникетов
+                                          на найденные шаблоны (их длина не более 18)
         :return: ДФ с фичами
         """
         df = self.initial_preparation(df, out_five_percent=out_five_percent)
 
-        # заполнение колонки user_word на трейне значением user_id
-        idx_isna_words = df['user_word'].isna()
-        df.loc[idx_isna_words, 'user_word'] = df.loc[idx_isna_words, 'user_id']
-        # количество проходов 'user_word', т.е. user_id за день + среднее медиана по ним
+        # print('df.user_id:', sorted(df.user_id.unique()))
+        # print('df.user_word:', sorted(df.user_word.unique()))
+
+        # количество проходов 'user_word', т.е. user_id за день + среднее медиана по ним +
+        # время прохода первого турникета, последнего и дельта между ними
+        # group_period = 'seconds'
+        group_period = 'minutes'
         grp = df.groupby(['user_word', 'date'], as_index=False).agg(
             list_gates_full=('gate_id', tuple),
+            time_start=(group_period, min),
+            time_end=(group_period, max),
+            time_delta=(group_period, lambda x: x.max() - x.min()),
         )
+        # удаление последовательных дублей дает хуже результат
+        # grp['list_gates_full'] = grp['list_gates_full'].map(self.remove_doubles)
         grp['user_day_beep'] = grp['list_gates_full'].map(len)
-        grp['user_day_mean'] = grp.groupby('user_word').user_day_beep.transform('mean')
-        grp['user_day_median'] = grp.groupby('user_word').user_day_beep.transform('median')
+        # grp['user_day_mean'] = grp.groupby('user_word').user_day_beep.transform('mean')
+        # grp['user_day_median'] = grp.groupby('user_word').user_day_beep.transform('median')
+        new_cols = []
+        for name_col in ('user_day_beep', 'time_start', 'time_end', 'time_delta'):
+            for grp_func in ('mean', 'median'):
+                grp_col = f'{name_col}_{grp_func}'
+                grp[grp_col] = grp.groupby('user_word')[name_col].transform(grp_func)
+                new_cols.append(grp_col)
+        # print(new_cols)
+
+        # счетчик: сколько и каких турникетов было пройдено за день
         grp['counter'] = grp['list_gates_full'].map(Counter)
 
-        df = df.merge(grp, on=['user_word', 'date'], how='left')
+        # всего посещений по user_id
+        grp['total_visits'] = grp.groupby('user_word').list_gates_full.transform('count')
+        # подсчет количества раз использования последовательности турникетов
+        gate_value_counts = grp['list_gates_full'].value_counts().to_frame()
+        gate_value_counts.columns = ['cnt_use_gates']
+        gate_value_counts.insert(0, 'list_gates_full', gate_value_counts.index)
+        grp = grp.merge(gate_value_counts, on='list_gates_full', how='left')
+        # отношение: сколько раз встречалась эта последовательность на кол-во визитов user_id
+        grp['ratio_gate'] = grp['cnt_use_gates'] / grp['total_visits']
+
+        # print(grp.columns)
+        # df_to_excel(grp, self.file_dir.joinpath('user_day_beep.xlsx'), float_cells=[5, 6])
+
+        if self.vectorizer is not None and 'vectorizer' not in self.exclude_columns:
+            if self.group_before_vectorizer is None:
+                gates_column = 'list_gates_full'
+                if replace_gates_full_vector:
+                    # новая колонка для обрезанной последовательности турникетов
+                    gates_column = 'remap_gates'
+                    # заменить полную последовательность турникетов на найденные
+                    gt = DataTransform3().fit_gate_times(df.copy(),
+                                                         remake_gates_mask=True,
+                                                         fill_user_id=True)
+                    gt['user_word'] = gt['user_id']
+                    gt[gates_column] = gt['gates']  # обрезанная последовательность
+                    grp = grp.merge(gt[['user_word', 'date', gates_column, 'counts']],
+                                    on=['user_word', 'date'], how='left')
+
+                # векторизация турникетов за один день по одному user_word
+                grp = self.vectorizer_gates(grp, gates_column)
+            else:
+                if isinstance(self.group_before_vectorizer, str):
+                    grp_cols = [self.group_before_vectorizer]
+                else:
+                    grp_cols = self.group_before_vectorizer
+                # векторизация турникетов за один день по всем user_id - такая карта дня
+                df = self.vectorizer_gates(df, 'list_gates_full', grp_cols)
+
+        # нужно убрать из исходного ДФ колонки, которые есть в grp - это дубли
+        df_columns = [col for col in df.columns if col not in grp.columns]
+        df_columns.extend(['user_word', 'date'])
+
+        df = df[df_columns].merge(grp, on=['user_word', 'date'], how='left')
+
         # print(grp.columns)
         # df_to_excel(grp, file_dir.joinpath('user_day_beep.xlsx'), float_cells=[3, 4])
 
         # выделение временных лагов между проходами через gate_id
-        lags = {'lag0': lambda x: not x, 'lag1': lambda x: x == 1, 'lag2': lambda x: x == 2,
+        lags = {'lag0': lambda x: not x,
+                'lag1': lambda x: x == 1,
+                'lag2': lambda x: x == 2,
                 'lag3': lambda x: x <= 3,
                 'lag4': lambda x: 2 < x <= 5,
                 'lag5': lambda x: 5 < x <= 15,
@@ -989,13 +1290,6 @@ class DataTransform:
             user_id_unique=('user_id', lambda x: x.nunique())
         )
         grp_week['prs'] = grp_week['counts'] / grp_week['counts'].sum()
-
-        grp_date = df.groupby(['date'], as_index=False).agg(
-            date_cnt=('ts', 'count')
-        )
-        grp_gate = df.groupby(['date', 'gate_id'], as_index=False).agg(
-            gate_cnt=('ts', 'count'),
-        )
         # группировки -------------------------------------------------
 
         if model_columns is None:
@@ -1004,14 +1298,17 @@ class DataTransform:
         if "user_id" not in model_columns:
             model_columns.insert(0, "user_id")
 
+        drop_gates = ['gcnt_0', 'gcnt_16', 'gate_id_0', 'gate_id_16']
+
         # добавление колонок с количеством турникетов за день по user_id
         if 'counter' not in self.exclude_columns and 'counter' in df.columns:
             unique_gates = sorted(df['gate_id'].unique())
             for gate in unique_gates:
-                mask_col = f'gate_{gate}'
-                df[mask_col] = df['counter'].map(lambda x: x.get(gate, 0))
-                self.numeric_columns.append(mask_col)
-                model_columns.append(mask_col)
+                if gate not in drop_gates:
+                    mask_col = f'gcnt_{gate}'
+                    df[mask_col] = df['counter'].map(lambda x: x.get(gate, 0))
+                    self.numeric_columns.append(mask_col)
+                    model_columns.append(mask_col)
             self.exclude_columns.append('counter')
 
         self.train_idxs = df[df.month.isin(self.train_months)].index
@@ -1021,7 +1318,26 @@ class DataTransform:
 
         df = self.apply_scaler(df)
 
-        model_columns.extend(self.new_columns)
+        # # тут просто посмотрим на типы колонок и их значения, какие нужно отдать скейлеру
+        # num_columns_out_1 = []
+        # for col in df.columns:
+        #     # print(f'{col} тип: {tmp[col].dtype}', str(tmp[col].dtype)[:4])
+        #     if str(df[col].dtype)[:4] in 'datetime':
+        #         continue
+        #     elif str(df[col].dtype) not in ('object', 'category'):
+        #         col_min = df[col].min()
+        #         col_max = df[col].max()
+        #         if abs(col_min) > 1 or abs(col_max) > 1:
+        #             num_columns_out_1.append((col, col_min, col_max))
+        # print(num_columns_out_1)
+
+        # print(df.columns.to_list())
+
+        if 'gate_id' in df.columns:
+            df['gate_id'] = df['gate_id'].map(
+                lambda x: x if x not in (0, 16, '0', '16') else 4)
+
+        model_columns.extend([col for col in self.new_columns if col not in drop_gates])
 
         exclude_columns = [col for col in self.exclude_columns if col in df.columns]
         exclude_columns.extend(col for col in df.columns if col not in model_columns)
@@ -1036,25 +1352,35 @@ class DataTransform:
 
         return df
 
-    def fit_transform(self, df, file_df=None, out_five_percent=False,
-                      remake_gates_mask=False, model_columns=None, drop_december=False):
+    def fit_transform(self, df, file_df=None, out_five_percent=False, drop_outlets=False,
+                      remake_gates_mask=False, model_columns=None, drop_december=False,
+                      replace_gates_full_vector=False, drop_outlet_weeks=False):
         """
         fit + transform
         :param df: исходный ФД
         :param file_df: Предобработанный Файл .pkl с полным путём
         :param out_five_percent: граница 5% при определении выбросов
+        :param drop_outlets: удалить редких юзеров и гейты
         :param remake_gates_mask: получить шаблоны масок из трейна, иначе взять из класса
         :param model_columns: список колонок, которые будут использованы в модели
         :param drop_december: удалить тех, кто в декабре не появлялся
+        :param replace_gates_full_vector: заменить полную последовательность турникетов
+                                          на найденные шаблоны (их длина не более 18)
+        :param drop_outlet_weeks: удалить из данных недели с выбросами
         :return: ДФ с фичами
         """
         df = self.fit(df, file_df=file_df,
                       out_five_percent=out_five_percent,
                       remake_gates_mask=remake_gates_mask,
-                      drop_december=drop_december)
+                      drop_december=drop_december,
+                      drop_outlets=drop_outlets,
+                      drop_outlet_weeks=drop_outlet_weeks
+                      )
         df = self.transform(df, model_columns=model_columns,
                             out_five_percent=out_five_percent,
-                            drop_december=drop_december)
+                            drop_december=drop_december,
+                            replace_gates_full_vector=replace_gates_full_vector
+                            )
         return df
 
     def train_test_split(self, df, y=None, *args, **kwargs):
@@ -1151,8 +1477,11 @@ class DataTransform2(DataTransform):
         self.drop_outlet_gates = None
         self.make_gate_pattern = True
         self.make_gate_counter = True
+        self.min_elements = 5
         self.out_user_id = None
-        self.file_dir = Path(kwargs.get('file_dir', Path(__file__).parent))
+        self.add_num_for_gates_full = 2
+        # сюда будем складывать подпоследовательности
+        self.new_found_sequences = set()
 
     @staticmethod
     def almost_equal(mask1, mask2, compare_first=2, last_different=True,
@@ -1233,8 +1562,23 @@ class DataTransform2(DataTransform):
                 return False
         return True
 
+    @staticmethod
+    def remove_outlets(gates):
+        # return tuple(gates)
+        # избавляемся от случайных турникетов 0 и 16
+        if gates[0] == 16:
+            if len(gates) > 3:
+                gates = gates[1:]
+            else:
+                gates = (5, 5, 6)
+        elif 16 in gates:
+            gates = [x if x != 16 else 4 for x in gates]
+        elif gates == (1, 1, 0, 0):
+            gates = (3, 3, 4, 4)
+        return tuple(gates)
+
     def fit_days_mask(self, df, out_five_percent=False, remove_double_gate=False,
-                      show_messages=True, drop_december=False):
+                      show_messages=True, drop_december=False, fill_user_id=True):
         """
         Построение маски турникетов для user_id по целому дню
         :param df: Объединенный датафрейм трейн и тест
@@ -1242,23 +1586,20 @@ class DataTransform2(DataTransform):
         :param remove_double_gate: удалить повторяющиеся подряд турникеты
         :param show_messages: Выводить сообщения о ходе процесса
         :param drop_december: удалить тех, кто в декабре не появлялся
+        :param fill_user_id: заполнять user_id == -1 значениями из user_word
         :return: Сгруппированный ДФ с маской турникетов по дням
         """
 
-        def remove_doubles(list_gates):
-            res = [list_gates[i] for i in range(len(list_gates))
-                   if i == 0 or list_gates[i] != list_gates[i - 1]]
-            return tuple(res)
-
         df = self.initial_preparation(df.copy(), out_five_percent=out_five_percent)
 
-        # присвоение отсутствующим user_id из теста закодированных слов
-        df.loc[df['user_id'] < 0, 'user_id'] = df.loc[df['user_id'] < 0, 'user_word']
+        if fill_user_id:
+            # присвоение отсутствующим user_id из теста закодированных слов
+            df.loc[df['user_id'] < 0, 'user_id'] = df.loc[df['user_id'] < 0, 'user_word']
 
         df.user_word.fillna('', inplace=True)  # заполнение пропусков user_word на трейне
 
-        group_period = 'seconds'
-        # group_period = 'minutes'
+        # group_period = 'seconds'
+        group_period = 'minutes'
         # список турникетов за день для user_id
         grp = df.groupby(['user_id', 'date'], as_index=False).agg(
             time_start=(group_period, min),
@@ -1270,7 +1611,8 @@ class DataTransform2(DataTransform):
         grp['total_visits'] = grp.groupby('user_id').list_gates_full.transform('count')
 
         # количество турникетов за день для одного user_id + среднее медиана по ним
-        grp['len_gates_full'] = grp.list_gates_full.map(len)
+        grp['list_gates_full'] = grp['list_gates_full'].map(self.remove_outlets)
+        grp['len_gates_full'] = grp['list_gates_full'].map(len)
         grp['len_gates_full_mean'] = grp.groupby('user_id') \
             .len_gates_full.transform('mean')
         grp['len_gates_full_median'] = grp.groupby('user_id') \
@@ -1278,16 +1620,20 @@ class DataTransform2(DataTransform):
 
         gates_col = 'list_gates_full'
         # удаляем повторяющиеся подряд турникеты
+        add_len = 0
         double_gate = ''
         if remove_double_gate:
             gates_col = 'list_gates'
             double_gate = '_remove_double_gate'
-            grp[gates_col] = grp.list_gates_full.map(remove_doubles)
+            grp[gates_col] = grp.list_gates_full.map(self.remove_doubles)
             # количество турникетов за день для одного user_id без повторяющихся турникетов
             name_col = 'len_gates'
             grp[name_col] = grp[gates_col].map(len)
             grp['len_gates_mean'] = grp.groupby('user_id')[name_col].transform('mean')
             grp['len_gates_median'] = grp.groupby('user_id')[name_col].transform('median')
+        else:
+            grp['list_gates'] = grp['list_gates_full']
+            add_len = self.add_num_for_gates_full
 
         grp['train'] = grp.user_id.map(lambda x: int(str(x).isnumeric()))
         # когда первый и последний раз проходил user_id
@@ -1325,12 +1671,13 @@ class DataTransform2(DataTransform):
         # df_to_excel(tmp, self.file_dir.joinpath(f'train_value_counts{double_gate}.xlsx'))
 
         # маски турникетов, которые встречаются 5 и более раз
-        self.gates_mask_count_ge5 = tmp[tmp.all_use_gates.ge(5)][
+        self.gates_mask_count_ge5 = tmp[tmp.all_use_gates.ge(self.min_elements)][
             gates_col].unique().tolist()
 
         # маски турникетов, которые встречаются 2-4 раза, user_id приходил менее 9 раз и
         # список турникетов есть в трейне и тесте
-        tmp = tmp[tmp.all_use_gates.gt(1) & tmp.all_use_gates.le(4) & tmp.total_visits.le(9)]
+        tmp = tmp[tmp.all_use_gates.gt(1) &
+                  tmp.all_use_gates.lt(self.min_elements) & tmp.total_visits.le(9)]
         tmp['train_count'] = tmp.groupby(gates_col).train.transform('count')
         self.gates_mask_count_2_4 = tmp[tmp.train_count.eq(2)][gates_col].unique().tolist()
 
@@ -1343,6 +1690,9 @@ class DataTransform2(DataTransform):
         # маски турникетов, которые не удовлетворяют двум вышеуказанным условиям
         gate_value_counts['outlet'] = gate_value_counts[gates_col].map(
             lambda x: x not in self.gates_mask).astype(int)
+
+        if not remove_double_gate:
+            gate_value_counts['list_gates'] = gate_value_counts['list_gates_full']
         # df_to_excel(gate_value_counts, self.file_dir.joinpath(f'gate_val_cnt{double_gate}.xlsx'))
 
         gvc = gate_value_counts
@@ -1350,19 +1700,26 @@ class DataTransform2(DataTransform):
         gvc['gates'] = gvc[gates_col]
 
         if gates_col == 'list_gates':
+            self.max_gates_len = 12
             # обрежем все маски до 12 элементов
-            gvc['gates'] = gvc[gates_col].apply(lambda x: tuple(x[:12]))
+            gvc['gates'] = gvc[gates_col].apply(lambda x: tuple(x[:self.max_gates_len]))
         else:
-            # Условие для фильтрации строк
-            condition = gvc['outlet'] == 1
-            # Берем первые 12 элементов из колонки gates_col по строкам с условием
-            gvc.loc[condition, 'gates'] = gvc.loc[
-                condition, 'gates'].apply(lambda x: tuple(x[:12]))
+            # максимальная длина последовательности турникетов
+            if self.max_gates_len:
+                max_gc = self.max_gates_len
+            else:
+                max_gc = grp[gates_col].map(len).max()
+            gvc['gates'] = gvc[gates_col].apply(lambda x: tuple(x[:max_gc]))
         gvc['len_g12'] = gvc['gates'].map(len)
         gvc['counts'] = gvc.groupby('gates').cnt_use_gates.transform(sum)
 
+        self.comment.update(max_gates_len=self.max_gates_len)
+
         # Условие для фильтрации: маски длиной от 9 турникетов, встречающиеся 5<= X <= 50 раз
-        condition = gvc['len_g12'].ge(9) & gvc['counts'].ge(5) & gvc['counts'].le(50)
+        alen = 0 if remove_double_gate else add_len
+        condition = (gvc['len_g12'].ge(9 + alen) &
+                     gvc['counts'].ge(self.min_elements) &
+                     gvc['counts'].le(50))
         mask_ge10 = sorted(gvc[condition].gates.unique(), key=len, reverse=True)
 
         mapping = pd.DataFrame(columns=['mask', 'len_mask', 'gates', 'use_gates'])
@@ -1383,15 +1740,14 @@ class DataTransform2(DataTransform):
 
         # замена исходных турникетов, на новые маски
         gvc['gates'] = gvc['gates'].map(lambda x: mapping_dict.get(x, x))
+        gvc = self.update_info(gvc, 'cnt_use_gates')
         gvc['counts'] = gvc.groupby('gates').cnt_use_gates.transform(sum)
-        gvc['outlet'] = gvc.apply(
-            lambda row: int(row.counts < 5 and row.gates not in self.gates_mask), axis=1)
 
         # ищем маски, которые отличаются друг от друга на 1 последний турникет
         if show_messages:
             print(f'Старый self.gates_mask: {len(self.gates_mask)} элементов')
         # Условие для фильтрации: маски встречающиеся 5<= X <= 50 раз
-        condition = gvc['counts'].ge(5) & gvc['counts'].le(50)
+        condition = gvc['counts'].ge(self.min_elements) & gvc['counts'].le(50)
         self.gates_mask = gvc[condition]['gates'].unique().tolist()
         self.gates_mask = sorted(set(self.gates_mask + self.gates_mask_count_2_4))
         if show_messages:
@@ -1416,21 +1772,10 @@ class DataTransform2(DataTransform):
         gvc['gates'] = gvc['gates'].map(lambda x: mapping_dict2.get(x, x))
         gvc['counts'] = gvc.groupby('gates').cnt_use_gates.transform(sum)
         gvc['outlet'] = gvc.apply(
-            lambda row: int(row.counts < 5 and row.gates not in self.gates_mask), axis=1)
+            lambda row: int(row.counts < self.min_elements
+                            and row.gates not in self.gates_mask), axis=1)
 
         gvc['len_g12'] = gvc['gates'].map(len)
-
-        # ищем маски, которые отличаются друг от друга на 1 турникет:
-        # при равной длине, 1 отличие на одинаковых позициях,
-        # при длине mask2 (х) больше на 1 чем mask1, один элемент в mask2 на любой позиции
-        # almost_equal_masks_dict = {}
-        # gvc_gts = gvc[['gates']]
-        # for mask in masks[:3]:
-        #     if len(mask) < 3:
-        #         continue
-        #     flt_gvc = gvc_gts.gates.map(
-        #         lambda x: len(x) > 2 and self.almost_equal(mask, x, last_different=False))
-        #     print(gvc_gts[flt_gvc].gates.tolist())
 
         self.gate_value_counts = gvc
 
@@ -1444,18 +1789,13 @@ class DataTransform2(DataTransform):
         df_to_excel(almost_equal_masks.drop_duplicates().sort_values('gates'),
                     self.file_dir.joinpath('almost_equal_masks.xlsx'))
 
-        # df_to_excel(gvc, self.file_dir.joinpath(f'gate_val_cnt{double_gate}.xlsx'))
+        df_to_excel(gvc, self.file_dir.joinpath(f'gate_val_cnt{double_gate}.xlsx'))
 
         # return grp
         # exit()
 
         # маски турникетов, которые встречаются 5 и более раз
-        gvc['counts'] = gvc.groupby('gates').cnt_use_gates.transform(sum)
-        gvc['outlet'] = gvc.apply(
-            lambda row: int(row.counts < 5 and row.gates not in self.gates_mask), axis=1)
-
-        self.gates_mask = gvc[gvc.counts.ge(5)]['gates'].unique().tolist()
-        self.gates_mask = sorted(set(self.gates_mask + self.gates_mask_count_2_4))
+        gvc = self.update_info(gvc, 'cnt_use_gates')
         if show_messages:
             print(f'Новый self.gates_mask:  {len(self.gates_mask)} элементов')
 
@@ -1478,8 +1818,17 @@ class DataTransform2(DataTransform):
 
         return grp
 
-    @staticmethod
-    def get_mapping_dict(df, len_mask, min_elements=5, one_parent=True):
+    def find_sub_mask(self, gates):
+        str_gate = str(gates)
+        for mask in self.gates_mask:
+            str_mask = str(mask)[:-1]
+            if len(mask) < 3 and str_gate.startswith(str_mask):
+                return True
+            if str_mask[1:] in str_gate:
+                return True
+        return False
+
+    def get_mapping_dict(self, df, len_mask, min_elements=5, one_parent=True):
         """
         Создание словаря для маппинга масок заданной подпоследовательности
         :param df: ДФ
@@ -1497,6 +1846,12 @@ class DataTransform2(DataTransform):
         flt = cdf[['gates', seq_name]].groupby(seq_name).filter(
             lambda x: len(x) >= min_elements)
         flt = flt[flt[seq_name].map(len) == len_mask].drop_duplicates()
+
+        self.new_found_sequences.update(flt[seq_name].unique())
+
+        print(f'Добавлено в self.new_found_sequences: {flt[seq_name].nunique()} элементов')
+        print(f'self.new_found_sequences: {len(self.new_found_sequences)} элементов')
+
         # Удаляем временную колонку seq_name, объединяем ДФ с новыми масками из seq_name
         cdf = pd.merge(cdf.drop(columns=[seq_name]), flt, on='gates', how='left')
         # оставим только те маски у которых только одна маска-предок
@@ -1507,11 +1862,30 @@ class DataTransform2(DataTransform):
         out_gates = sum(tmp['parent'].tolist(), [])
         if not one_parent:
             out_gates = []
+
+        # В out_gates нужно добавить маски в которых содержатся маски меньшего размера
+        tmp = cdf.copy()
+        tmp['out'] = tmp.gates.map(self.find_sub_mask)
+        tmp = tmp[tmp['out']]
+        if len(tmp):
+            # out_gates.extend(tmp.gates.tolist())
+            pass
+
         # Фильтруем по маскам, которые нужно исключить
         flt = cdf[~cdf.gates.isin(out_gates)][['gates', seq_name]].dropna()
         gates_mapping_dict = flt.drop_duplicates('gates').set_index('gates')[
             seq_name].to_dict()
         return gates_mapping_dict, cdf
+
+    def update_info(self, dfg, gate_cnt):
+        dfg['len_g12'] = dfg['gates'].map(len)
+        dfg['counts'] = dfg.groupby('gates')[gate_cnt].transform(sum)
+        dfg['outlet'] = dfg.apply(
+            lambda row: int(row.counts < self.min_elements
+                            and row.gates not in self.gates_mask), axis=1)
+        self.gates_mask = dfg[dfg.counts.ge(self.min_elements)]['gates'].unique().tolist()
+        self.gates_mask = sorted(set(self.gates_mask + self.gates_mask_count_2_4))
+        return dfg
 
     def update_gates(self, dfg, mapping_dict, len_mask):
         """
@@ -1522,19 +1896,17 @@ class DataTransform2(DataTransform):
         :return: измененный ДФ
         """
         dfg['gates'] = dfg['gates'].map(lambda x: mapping_dict.get(x, x))
-        dfg['len_g12'] = dfg['gates'].map(len)
-        dfg['counts'] = dfg.groupby('gates')['gate_cnt'].transform(sum)
-        dfg['outlet'] = dfg.apply(
-            lambda row: int(row.counts < 5 and row.gates not in self.gates_mask), axis=1)
-        self.gates_mask = dfg[dfg.counts.ge(5)]['gates'].unique().tolist()
-        self.gates_mask = sorted(set(self.gates_mask + self.gates_mask_count_2_4))
+        dfg = self.update_info(dfg, 'gate_cnt')
         print(f'Новый self.gates_mask {len_mask:2}:  {len(self.gates_mask)} элементов')
         return dfg
 
-    def find_gates_pattern(self, all_df, debug=False):
+    def find_gates_pattern(self, all_df, remove_double_gate=False, replace_patterns=True,
+                           debug=False):
         """
         Поиск паттернов по шаблонам для каждого user_id
         :param all_df: датафрейм
+        :param remove_double_gate: удалить повторяющиеся подряд турникеты
+        :param replace_patterns: заменять редкие паттерны у пользователей
         :param debug: выводить на экран отладочную информацию
         :return: датафрейм c заполненными шаблонами
         """
@@ -1553,13 +1925,42 @@ class DataTransform2(DataTransform):
         dfg = dfg.sort_values(['gates', 'list_gates', 'user_id']).reset_index(drop=True)
         df_to_excel(dfg, self.file_dir.joinpath('gate_users.xlsx'))
 
-        mapping_dict, _ = self.get_mapping_dict(dfg, 11, one_parent=False)
-        dfg = self.update_gates(dfg, mapping_dict, 11)
+        add_len = self.add_num_for_gates_full
+        if self.max_gates_len:
+            max_gc = self.max_gates_len  # максимальная длина последовательности турникетов
+        else:
+            max_gc = dfg['list_gates'].map(len).max()
+
+        print('self.gates_mask:', len(self.gates_mask))
+
+        add_len = 0 if remove_double_gate else max(add_len, max_gc - 11)
+        # mapping_dict, _ = self.get_mapping_dict(dfg, 11 + add_len,
+        #                                         min_elements=self.min_elements,
+        #                                         one_parent=False)
+        mapping_dict, dfg = self.get_mapping_dict(dfg, 11 + add_len,
+                                                  min_elements=self.min_elements,
+                                                  one_parent=False)
+
+        dfg = self.update_gates(dfg, mapping_dict, 11 + add_len)
 
         # # замена исходных турникетов, на новые маски
-        for len_mask in range(10, 5, -2):
-            mapping_dict, _ = self.get_mapping_dict(dfg, len_mask, one_parent=True)
+        add_len = 0 if remove_double_gate else max(2, add_len - 1)
+        mask_lens = [*range(10 + add_len, 3, -2)]
+        # if 3 not in mask_lens:
+        #     mask_lens.append(3)
+        for len_mask in mask_lens:
+            # mapping_dict, _ = self.get_mapping_dict(dfg, len_mask,
+            #                                         min_elements=self.min_elements,
+            #                                         one_parent=True)
+            mapping_dict, dfg = self.get_mapping_dict(dfg, len_mask,
+                                                      min_elements=self.min_elements,
+                                                      one_parent=True)
+
             dfg = self.update_gates(dfg, mapping_dict, len_mask)
+
+        print('gates_mask:', len(set(self.gates_mask) | set(self.new_found_sequences)))
+
+        df_to_excel(dfg, self.file_dir.joinpath('dfg.xlsx'))
         #
         # ОПЫТЫ с этой частью кода ведутся в tst_mask.py !!!
         #
@@ -1580,7 +1981,8 @@ class DataTransform2(DataTransform):
             # и длина > 1 -> добавим в начало его самый любимый номер турникета
             df.gates = df.gates.apply(
                 lambda x: (common_first_gate,) + x
-                if first_gates.get(x[0], 0) / len(df) * 100 <= 5 and len(x) > 1 else x)
+                if first_gates.get(x[0], 0) / len(df) * 100 <= 5
+                   and len(x) > 1 and not self.find_sub_mask(x) else x)
 
             df['found_gates'] = ''
             for index, row in df.iterrows():
@@ -1600,8 +2002,9 @@ class DataTransform2(DataTransform):
             # no_found_gates = no_found.gates.tolist()
             # print(no_found_gates)
 
+            one = int(not remove_double_gate)
             for index, row in no_found.iterrows():
-                for mask in filter(lambda x: x[:2] == row.gates[:2], user_masks):
+                for mask in filter(lambda x: x[:2 + one] == row.gates[:2 + one], user_masks):
                     if self.almost_equal(row.gates, mask, last_different=False,
                                          user_find=True):
                         df.at[index, 'found_gates'] = mask
@@ -1631,22 +2034,30 @@ class DataTransform2(DataTransform):
                 # print(tmp)
                 if len(tmp):
                     # print('tmp.gate_cnt.argmax()', tmp.gate_cnt.argmax())
-                    most_common = tmp.iloc[tmp.gate_cnt.argmax()].found_gates
+                    most_value = tmp.iloc[tmp.gate_cnt.argmax()].found_gates
                     if debug:
-                        print('most_common', most_common)
-                    df.at[index, 'found_gates'] = most_common
-                    df.at[index, 'replace'] = most_common
+                        print('most_common', most_value)
+                    df.at[index, 'found_gates'] = most_value
+                    df.at[index, 'replace'] = most_value
+
+            found = df[df['found_gates'].map(len).gt(0) & df['outlet'].eq(1)]
+            if len(found):
+                # print(f'found gate for user {user_id}:\n', found[['gates', 'found_gates']])
+                for index, row in found.iterrows():
+                    if row['gates'] != row['found_gates']:
+                        df.at[index, 'gates'] = row['found_gates']
 
             # Если не смогли подобрать последовательность турникетов - тогда заполним самой
-            # популярной последовательностью
+            # популярной последовательностью для этого user_id
             no_found = df[df['found_gates'].map(len) < 1]
+            # if len(no_found) and replace_patterns:
             if len(no_found):
-                most_common = df.iloc[df.gate_cnt.argmax()].found_gates
+                most_value = df.iloc[df.gate_cnt.argmax()].found_gates
                 if debug:
-                    print('Наиболее часто используемая последовательность', most_common)
+                    print('Наиболее часто используемая последовательность', most_value)
                 for index, row in no_found.iterrows():
-                    df.at[index, 'found_gates'] = most_common
-                    df.at[index, 'replace'] = most_common
+                    df.at[index, 'found_gates'] = most_value
+                    df.at[index, 'replace'] = most_value
 
             # Если не смогли подобрать последовательность турникетов - тогда заполним самой
             # популярной последовательностью из всего, которая начинается с такого турникета
@@ -1659,29 +2070,32 @@ class DataTransform2(DataTransform):
                 df_copy['start'] = df_copy['gates'].map(lambda x: str(x).startswith(gate1))
                 tmp = df_copy[df_copy['start'] & (df_copy['len_g12'] <= len(row.gates) + 1)]
                 # print(tmp)
-                if len(tmp):
+                if len(tmp) and replace_patterns:
                     # print('tmp.gate_cnt.argmax()', tmp.gate_cnt.argmax())
-                    most_common = tmp.iloc[tmp.gate_cnt.argmax()]['gates']
+                    most_value = tmp.iloc[tmp.gate_cnt.argmax()]['gates']
                     if debug:
-                        print('most_common', most_common)
-                    df.at[index, 'found_gates'] = most_common
-                    df.at[index, 'replace'] = most_common
+                        print('most_common:', most_value)
+                    df.at[index, 'found_gates'] = most_value
+                    df.at[index, 'replace'] = most_value
 
             # Если не смогли подобрать последовательность турникетов - тогда заполним самым
             # популярным для этого user_id
-            no_found = df[df['found_gates'].map(len) < 1]
-            most_common = df[df['found_gates'].map(len) > 0]['found_gates'].value_counts()
-            if len(set(most_common.tolist())) > 1:
-                most_common = most_common.index[0]
-            else:
-                most_common = df.loc[df['counts'].idxmax(), 'found_gates']
-            if debug:
-                print('most_common', most_common)
-            for index, row in no_found.iterrows():
-                df.at[index, 'found_gates'] = most_common
-                df.at[index, 'replace'] = most_common
+            if replace_patterns:
+                no_found = df[df['found_gates'].map(len) < 1]
+                most_value = df[df['found_gates'].map(len) > 0]['found_gates'].value_counts()
+                if len(set(most_value.tolist())) > 1:
+                    most_value = most_value.index[0]
+                else:
+                    most_value = df.loc[df['counts'].idxmax(), 'found_gates']
+                if debug:
+                    print('most_common:', most_value)
+                for index, row in no_found.iterrows():
+                    df.at[index, 'found_gates'] = most_value
+                    df.at[index, 'replace'] = most_value
 
             users = pd.concat([users, df])
+
+        users = self.update_info(users, 'gate_cnt')
 
         cwd = [(0, 14), (1, 52)] + [(2, 10)] * 4 + [(6, 40)] + [(7, 10)] * 2 + [(9, 40)] * 2
         df_to_excel(users, self.file_dir.joinpath('find_gates_patt.xlsx'), ins_col_width=cwd)
@@ -1691,7 +2105,7 @@ class DataTransform2(DataTransform):
         return all_df
 
     def fit(self, df, file_df=None, out_five_percent=False, remake_gates_mask=True,
-            drop_december=False):
+            drop_december=False, drop_outlets=False, drop_outlet_weeks=False):
         """
         Формирование фич
         :param df: исходный ФД
@@ -1699,11 +2113,21 @@ class DataTransform2(DataTransform):
         :param out_five_percent: граница 5% при определении выбросов
         :param remake_gates_mask: получить шаблоны масок из трейна, иначе взять из класса
         :param drop_december: удалить тех, кто в декабре не появлялся
+        :param drop_outlets: удалить редких юзеров и гейты
+        :param drop_outlet_weeks: удалить из данных недели с выбросами
         :return: обработанный ДФ
         """
         if file_df and file_df.suffix == '.pkl' and file_df.is_file():
             df = pd.read_pickle(file_df)
+            if drop_outlets:
+                df = self.drop_outlets_user_gate(df)
             return df
+
+        df = self.initial_preparation(df, out_five_percent=out_five_percent,
+                                      drop_outlet_weeks=drop_outlet_weeks)
+
+        if drop_outlets:
+            df = self.drop_outlets_user_gate(df)
 
         # удаление user_id с выбросами
         if self.drop_outlet_users is not None and isinstance(self.drop_outlet_users,
@@ -1714,14 +2138,16 @@ class DataTransform2(DataTransform):
                                                              (list, tuple)):
             df = df[~df.gate_id.isin(self.drop_outlet_gates)]
 
+        remove_double_gate = False
         # ищем шаблоны последовательности турникетов
         df = self.fit_days_mask(df, out_five_percent=out_five_percent,
-                                remove_double_gate=True, drop_december=drop_december)
+                                remove_double_gate=remove_double_gate,
+                                drop_december=drop_december)
 
         self.gates_mask = sorted(set(self.gates_mask_count_2_4 + self.gates_mask_count_ge5))
 
         start_time = print_msg('Поиск по шаблонам...')
-        df = self.find_gates_pattern(df)
+        df = self.find_gates_pattern(df, remove_double_gate=remove_double_gate)
 
         df = df.sort_values(['date', 'time_start', 'user_id']).reset_index(drop=True)
 
@@ -1732,6 +2158,25 @@ class DataTransform2(DataTransform):
             df_to_excel(df, self.preprocess_path_file.with_suffix('.xlsx'), ins_col_width=wd)
 
         print_time(start_time)
+        return df
+
+    @staticmethod
+    def add_gate_pattern(df, gates_mask):
+        """
+        Добавление бинарных колонок с вхождением маски в последовательность
+        :param df: ДФ
+        :param gates_mask: список масок турникетов
+        :return: обработанный ДФ
+        """
+        # Проверить гипотезу со сравнением маски с последовательностью турникетов
+        # не на равенство, а по str(x).startswith(str(mask)[:-1])
+        for mask in tqdm(sorted(gates_mask)):
+            mask_col = 'G' + '_'.join(map(str, mask))
+            # если длина маски 1-3 турникета - то смотрим начало последовательности,
+            # если длина маски > 3 - смотрим на вхождение маски в последовательность
+            df[mask_col] = df.found_gates.map(
+                lambda x: str(x).startswith(str(mask)[:-1]) if len(mask) < 4
+                else str(mask)[1:-1] in str(x)).astype(int)
         return df
 
     def transform(self, df, model_columns=None, out_five_percent=False, mem_compress=True,
@@ -1756,6 +2201,7 @@ class DataTransform2(DataTransform):
 
         # сортировка почти как в исходном ДФ
         df = df.sort_values(['date', 'time_start', 'user_id']).reset_index(drop=True)
+        df['row_id'] = df.index
 
         if drop_december:
             # Попробовать убрать те user_id, которых не было в декабре
@@ -1766,13 +2212,10 @@ class DataTransform2(DataTransform):
         if self.make_gate_pattern:
             # Проверить гипотезу со сравнением маски с последовательностью турникетов
             # не на равенство, а по str(x).startswith(str(mask)[:-1])
-            for mask in tqdm(sorted(self.gates_mask)):
-                mask_col = 'G' + '_'.join(map(str, mask))
-                # df[mask_col] = df.found_gates.map(lambda x: int(x == mask))
-                df[mask_col] = df.found_gates.map(
-                    lambda x: int(str(x).startswith(str(mask)[:-1])))
+            df = self.add_gate_pattern(df, self.gates_mask)
 
         if self.make_gate_counter:
+            drop_gates = ['gate_0', 'gate_16']
             # Исходный список
             # df['counter'] = df.list_gates_full.map(Counter)
             # Список турникетов за день для одного user_id без повторяющихся турникетов
@@ -1780,9 +2223,10 @@ class DataTransform2(DataTransform):
             unique_gates = df['list_gates'].unique().tolist()
             unique_gates = sorted(set(sum(map(list, unique_gates), [])))
             for gate in unique_gates:
-                mask_col = f'gate_{gate}'
-                df[mask_col] = df['counter'].map(lambda x: x.get(gate, 0))
-                self.numeric_columns.append(mask_col)
+                if gate not in drop_gates:
+                    mask_col = f'gcnt_{gate}'
+                    df[mask_col] = df['counter'].map(lambda x: x.get(gate, 0))
+                    self.numeric_columns.append(mask_col)
 
         if model_columns is None:
             model_columns = df.columns.to_list()
@@ -1812,13 +2256,110 @@ class DataTransform2(DataTransform):
             df.user_id = df.user_id.astype(int)
 
         # Переводим типы данных в минимально допустимые - экономим ресурсы
-        df = memory_compression(df)
+        df = memory_compression(df, exclude_columns=['counter'])
 
-        file_dir = Path(__file__).parent
         wd = [(0, 12)] * len(df.columns)
         df_to_excel(df, self.file_dir.joinpath('df_to_model.xlsx'), ins_col_width=wd)
 
         return df
+
+
+class DataTransform3(DataTransform):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.save_gates_mask = self.gates_mask.copy()
+        self.save_gates_M_V2 = self.gates_M_V2.copy()
+        self.max_gates_len = 18
+        self.vector_limit = 18
+        self.gates_mask = self.gates_M_V2 = []
+        self.make_patterns_on_full_dataset = True
+
+        self.data_cls = DataTransform2()
+        self.data_cls.max_gates_len = 18
+        self.data_cls.vector_limit = 18
+        self.data_cls.min_elements = 5
+
+    def fit_gate_times(self, df, all_df=None, remake_gates_mask=False,
+                       use_gates_mask_V2=False, fill_user_id=False):
+        """
+        Получение паттернов прохода через турникеты
+        :param df: тренировочный ДФ
+        :param all_df: объединенный ДФ
+        :param remake_gates_mask: получить шаблоны масок из трейна, иначе взять из класса
+        :param use_gates_mask_V2: использовать расширенный набор масок из класса
+        :param fill_user_id: заполнять user_id == -1 значениями из user_word
+        :return: ДФ с паттернами
+        """
+        if all_df is None:
+            all_df = df.copy()
+
+        start_time = print_msg('Ищу паттерны в данных...')
+
+        # ищем шаблоны последовательности турникетов
+        grp = self.data_cls.fit_days_mask(df, fill_user_id=fill_user_id)
+        self.gates_mask = self.gates_M_V2 = sorted(set(self.data_cls.gates_mask_count_2_4 +
+                                                       self.data_cls.gates_mask_count_ge5))
+        # print(all_df.user_id.unique())
+        # print(all_df.user_word.unique())
+
+        grp = self.data_cls.find_gates_pattern(grp, replace_patterns=False)
+        self.gates_mask = self.data_cls.gates_mask
+
+        if use_gates_mask_V2:
+            # прочитаем паттерны из файла: достанем из названий колонок
+            file_df = GATES_DIR.joinpath('preprocess_df_MV2.pkl')
+            if file_df.is_file():
+                tmp = pd.read_pickle(file_df)
+                old_mask = [tuple(map(int, col.replace('G', '').split('_')))
+                            for col in tmp.columns if col.startswith('G')]
+                # print('cols:', old_mask)
+            else:
+                old_mask = self.save_gates_M_V2
+
+            # проверим не начинаются ли новые паттерны как подстрока старых из файла
+            old_out = set()
+            for mask in self.gates_mask:
+                for old in old_mask:
+                    old_gate = str(old)
+                    str_mask = str(mask)[:-1]
+                    if old_gate.startswith(str_mask):
+                        old_out.add(old)
+            old_mask = set(old_mask) - old_out
+            # print('\nold_out:', old_out)
+
+            print(f'old len(self.gates_mask)={len(self.gates_mask)}')
+            self.gates_mask = sorted(set(self.gates_mask + list(old_mask)))
+            print(f'new len(self.gates_mask)={len(self.gates_mask)}')
+
+        grp = self.data_cls.add_gate_pattern(grp, self.gates_mask)
+
+        grp_columns = [col for col in grp.columns if col not in all_df.columns]
+        grp_columns.extend(['user_word', 'date'])
+
+        self.fit_df = all_df.merge(grp[grp_columns], on=['user_word', 'date'], how='left')
+
+        if 'train' in self.fit_df.columns:
+            self.fit_df.loc[self.fit_df.train < 1, 'user_id'] = -1
+            self.fit_df.user_id = self.fit_df.user_id.astype(int)
+            self.fit_df.drop('train', axis=1, inplace=True)
+
+        print_time(start_time)
+        return grp
+
+    @staticmethod
+    def find_gates(row, mask, *args, **kwargs):
+        """
+        Поиск паттернов по шаблонам
+        :param row: строка датафрейма
+        :param mask: шаблон
+        :return: True / False --> найден паттерн по шаблону или нет
+        """
+        # если длина маски 1-2 турникета - то смотрим начало последовательности,
+        # если длина маски > 2 - смотрим на вхождение маски в последовательность
+        str_gate = str(row['gates'])
+        str_mask = str(mask)[:-1]
+        return str_gate.startswith(str_mask) if len(mask) < 3 else str_mask[1:] in str_gate
 
 
 if __name__ == "__main__":
@@ -1832,27 +2373,51 @@ if __name__ == "__main__":
     numeric_columns = ['min', 'minutes', 'seconds', 'beep_count', 'beep_gate', 'row_id']
     cat_columns = ['gate_id', 'weekday', 'hour']
 
-    data_cls = DataTransform(category_columns=cat_columns, drop_first=False,
-                             # numeric_columns=numeric_columns, scaler=StandardScaler,
-                             )
-    prefix_preprocess = '_MV2'
-    data_cls.preprocess_path_file = GATES_DIR.joinpath(
-        f'preprocess_df{prefix_preprocess}.pkl')
+    data_cls = DataTransform3(category_columns=cat_columns, drop_first=False,
+                              # numeric_columns=numeric_columns, scaler=StandardScaler,
+                              )
+    # prefix_preprocess = '_MV2'
+    # data_cls.preprocess_path_file = GATES_DIR.joinpath(
+    #     f'preprocess_df{prefix_preprocess}.pkl')
 
-    data_cls.beep_outlet = 98.7
-    all_df = data_cls.fit(all_df, file_df=data_cls.preprocess_path_file,
-                          remake_gates_mask=False)
+    df = data_cls.initial_preparation(all_df)
 
-    # Добавление номера строки вместе с scaler=StandardScaler чуть увеличивает скор
-    all_df['row_id'] = all_df.index
+    # присвоение отсутствующим user_id из теста закодированных слов
+    df.loc[df['user_id'] < 0, 'user_id'] = df.loc[df['user_id'] < 0, 'user_word']
 
-    all_df = data_cls.transform(all_df)
-    all_df.to_csv(GATES_DIR.joinpath(f'all_df{prefix_preprocess}.csv'))
+    df_gt = data_cls.fit_gate_times(df, remake_gates_mask=True, use_gates_mask_V2=True)
+    print('Количество паттернов:', len(data_cls.gates_mask))
+    df_to_excel(df_gt, GATES_DIR.joinpath(f'df_gt3.xlsx'))
 
-    gate_col = sorted([col for col in all_df.columns if col.startswith('gate_')],
-                      key=lambda x: (int(x.split('_')[-1]), x))
+    # data_cls.beep_outlet = 98.7
+    # # all_df = data_cls.initial_preparation(all_df)
+    # all_df = data_cls.fit(all_df, file_df=data_cls.preprocess_path_file,
+    #                       remake_gates_mask=False)
 
-    df = all_df[['user_id', 'ts', 'date'] + gate_col]
-    wd = [(0, 16)] * len(df.columns)
-    df_to_excel(df, GATES_DIR.joinpath(f'all_df_gates{prefix_preprocess}.xlsx'),
-                ins_col_width=wd)
+    # # Добавление номера строки вместе с scaler=StandardScaler чуть увеличивает скор
+    # all_df['row_id'] = all_df.index
+    #
+    # all_df = data_cls.transform(all_df)
+    #
+    # print(all_df.columns)
+    #
+    # # all_df.to_csv(GATES_DIR.joinpath(f'all_df{prefix_preprocess}.csv'))
+    #
+    # gate_cnt_cols = sorted([c for c in all_df.columns if c.startswith(('gcnt_', 'gate_'))],
+    #                        key=lambda x: (int(x.split('_')[-1]), x))
+    #
+    # df = all_df[['user_id', 'ts', 'date'] + gate_cnt_cols]
+    # wd = [(0, 16)] * len(df.columns)
+    # df_to_excel(df, GATES_DIR.joinpath(f'all_df_gates{prefix_preprocess}.xlsx'),
+    #             ins_col_width=wd)
+
+    # all_df = data_cls.initial_preparation(all_df)
+    # data_cls.vector_limit = 0
+    # data_cls.ngram_range = (2, 3)
+    # data_cls.group_before_vectorizer = ['date']
+    # df = data_cls.vectorizer_gates(all_df, 'list_gates_full', ['date'])
+    # # wd = [(0, 16)] * len(df.columns)
+    # # df_to_excel(df, GATES_DIR.joinpath(f'df_vectorizer_gates{prefix_preprocess}.xlsx'),
+    # #             ins_col_width=wd)
+    #
+    # print(df.columns.to_list())
