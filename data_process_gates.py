@@ -135,6 +135,17 @@ def prepare_df_words(file_submit_csv, test_df, out_user_id=[]):
     file_dir = Path(__file__).parent
 
     all_df = read_all_df(file_dir)
+
+    # Здесь надо повторить обработку all_df как в классификаторе:
+    # - удаление дублей
+    # - турникетов 0,16
+    # - случайных user_id 4, 51, 52
+    # - тех, кто не ходил в декабре
+    # - удаление дубликатов
+    # - удаление неполноценных недель
+
+    ############################################################
+
     data_cls = DataTransform2()
     grp = data_cls.fit_days_mask(all_df, show_messages=False, remove_double_gate=True,
                                  drop_december=True)
@@ -229,8 +240,8 @@ def find_predict_words(file_submit_csv, test_df, user_id_max=60):
     out_user_id = []
     # пока зафиксируем эти user_id для удаления
     # out_user_id = [5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 57]
-    # out_user_id = [4, 5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 52, 57]
-    out_user_id = [4, 51, 52]
+    out_user_id = [4, 5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 51, 52, 57]
+    # out_user_id = [4, 51, 52]
     # out_user_id = [4, 51]
 
     words, grp, p_values = prepare_df_words(file_submit_csv, test_df,
@@ -701,6 +712,8 @@ class DataTransform:
                            (13, 13, 12, 12), (13, 13, 12, 12, 11), (15, 3, 3),
                            (15, 3, 3, 10), (15, 3, 3, 10, 11), (15, 9, 9), (15, 9, 9, 5, 5),
                            ]
+        # список user_id, которых исключили в декабре
+        self.out_user_id = []
         self.fit_df = None
         self.make_patterns_on_full_dataset = False
         self.gates_mask_count_2_4 = None
@@ -736,7 +749,7 @@ class DataTransform:
         :param drop_outlet_weeks: удалить из данных недели с выбросами
         :return: обработанный ДФ
         """
-        if 'ts' not in df.columns:
+        if 'ts' not in df.columns and 'timestamp' in df.columns:
             df.rename(columns={'timestamp': 'ts'}, inplace=True)
 
         df["date"] = df['ts'].dt.date
@@ -787,6 +800,10 @@ class DataTransform:
             grp_week = df.groupby(['week'], as_index=False).agg(counts=('ts', 'count'))
             out_weeks = grp_week[grp_week.counts < 777].week.tolist()
             df = df[~df['week'].isin(out_weeks)]
+
+        df['no_december'] = df.groupby(['user_word']).ts.transform(max)
+        df['no_december'] = df['no_december'].map(
+            lambda x: x.month not in (1, 2, 12)).astype(int)
 
         # Подсчет количества срабатываний за день
         df["beep_count"] = df.groupby("date").ts.transform("count")
@@ -1015,11 +1032,26 @@ class DataTransform:
 
     def drop_outlets_user_gate(self, df):
         if 'gate_id' in df.columns:
-            outlet_user_gate = df.user_id.isin([4, 51]) | df.gate_id.isin([0, 16])
+            outlet_user_gate = df.user_id.isin([4, 51, '4', '51']) | df.gate_id.isin([0, 16])
             self.comment.update(drop_users='4,51', drop_gates='0,16')
         else:
-            outlet_user_gate = df.user_id.isin([4, 51])
+            outlet_user_gate = df.user_id.isin([4, 51, '4', '51'])
             self.comment.update(drop_users='4,51')
+        return df[~outlet_user_gate]
+
+    def drop_no_december_users(self, df):
+        # заполнение колонки user_word на трейне значением user_id
+        idx_isna_words = df['user_word'].isna()
+        df.loc[idx_isna_words, 'user_word'] = df.loc[idx_isna_words, 'user_id']
+
+        grp = df.groupby(['user_word'], as_index=False).agg(last_show=('date', max))
+        grp['no_december'] = grp['last_show'].map(
+            lambda x: pd.to_datetime(x).month not in (1, 2, 12)).astype(int)
+        # Убрать те user_id, которых не было в декабре
+        out_user_id = grp[grp['no_december'].eq(1)].user_word.unique()
+        self.comment.update(drop_december=','.join(map(str, sorted(out_user_id))))
+        self.out_user_id = sorted(out_user_id)
+        df = df[~df.user_word.isin(out_user_id)]
         return df
 
     def fit(self, df, file_df=None, out_five_percent=False, remake_gates_mask=False,
@@ -1478,7 +1510,7 @@ class DataTransform2(DataTransform):
         self.make_gate_pattern = True
         self.make_gate_counter = True
         self.min_elements = 5
-        self.out_user_id = None
+        self.out_user_id = []
         self.add_num_for_gates_full = 2
         # сюда будем складывать подпоследовательности
         self.new_found_sequences = set()
@@ -1596,7 +1628,9 @@ class DataTransform2(DataTransform):
             # присвоение отсутствующим user_id из теста закодированных слов
             df.loc[df['user_id'] < 0, 'user_id'] = df.loc[df['user_id'] < 0, 'user_word']
 
-        df.user_word.fillna('', inplace=True)  # заполнение пропусков user_word на трейне
+        # заполнение колонки user_word на трейне значением user_id
+        idx_isna_words = df['user_word'].isna()
+        df.loc[idx_isna_words, 'user_word'] = df.loc[idx_isna_words, 'user_id']
 
         # group_period = 'seconds'
         group_period = 'minutes'
@@ -2385,9 +2419,9 @@ if __name__ == "__main__":
     # присвоение отсутствующим user_id из теста закодированных слов
     df.loc[df['user_id'] < 0, 'user_id'] = df.loc[df['user_id'] < 0, 'user_word']
 
-    df_gt = data_cls.fit_gate_times(df, remake_gates_mask=True, use_gates_mask_V2=True)
-    print('Количество паттернов:', len(data_cls.gates_mask))
-    df_to_excel(df_gt, GATES_DIR.joinpath(f'df_gt3.xlsx'))
+    # df_gt = data_cls.fit_gate_times(df, remake_gates_mask=True, use_gates_mask_V2=True)
+    # print('Количество паттернов:', len(data_cls.gates_mask))
+    # df_to_excel(df_gt, GATES_DIR.joinpath(f'df_gt3.xlsx'))
 
     # data_cls.beep_outlet = 98.7
     # # all_df = data_cls.initial_preparation(all_df)
@@ -2421,3 +2455,15 @@ if __name__ == "__main__":
     # #             ins_col_width=wd)
     #
     # print(df.columns.to_list())
+
+    print(df.no_december.value_counts())
+
+    print(df.shape)
+    df = data_cls.drop_outlets_user_gate(df)
+    print(df.shape)
+    df = data_cls.drop_no_december_users(df)
+    print(df.shape)
+    print(data_cls.out_user_id)
+    print(data_cls.comment)
+
+    print(df.no_december.value_counts())
