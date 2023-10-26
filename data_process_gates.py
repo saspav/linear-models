@@ -281,19 +281,33 @@ def find_predict_words(file_submit_csv, test_df, user_id_max=60):
     if fill_no_user_id and len(no_user_id):
         # print(no_user_id)
         for index, row in no_user_id.iterrows():
+            if row.user_word in ('regression', 'y'):
+                continue
             tmp = grp[grp.user_id == row.user_word]
             # print(tmp)
             time_start = tmp.time_start.min() * 0.8
             time_end = tmp.time_end.max() * 1.2
             temp = grp[
-                # (grp['first_show'] > pd.to_datetime('2022-12-01').date()) &
-                (grp['date'] < pd.to_datetime('2023-01-01').date()) &
-                ~grp.user_id.isin(words.pred.unique()) &
-                (grp.time_start > time_start) & (grp.time_end < time_end)
+                (pd.to_datetime(grp['first_show']).dt.date > pd.to_datetime(
+                    '2022-12-01').date())
+                & (pd.to_datetime(grp['date']).dt.date < pd.to_datetime('2023-01-01').date())
+                & ~grp.user_id.isin(uses_preds.keys())
+                & ~grp.user_id.isin(out_user_id)
+                & (grp.time_start > time_start) & (grp.time_end < time_end)
                 ]
+            if not len(temp):
+                temp = grp[
+                    (pd.to_datetime(grp['date']).dt.date < pd.to_datetime(
+                        '2023-01-01').date())
+                    & ~grp.user_id.isin(uses_preds.keys())
+                    & ~grp.user_id.isin(out_user_id)
+                    & (grp.time_start > time_start) & (grp.time_end < time_end)
+                    ]
             temp = temp.sort_values('first_show', ascending=False).reset_index(drop=True)
             user_id = temp.at[0, 'user_id']
             words.at[index, 'pred'] = user_id
+            no_user_id.at[index, 'pred'] = user_id
+
 
             # print(temp)
             df_to_excel(temp, file_dir.joinpath('grp.xlsx'))
@@ -323,6 +337,7 @@ def find_predict_words2(file_submit_csv, test_df, user_id_max=60):
     out_user_id = []
     out_user_id = 'auto'
     # пока зафиксируем эти user_id для удаления
+    out_user_id = [4, 5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 51, 52, 57]
     # out_user_id = [5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 57]
     # out_user_id = [4, 51, 52]
     # out_user_id = [4, 51]
@@ -330,7 +345,7 @@ def find_predict_words2(file_submit_csv, test_df, user_id_max=60):
     words, grp, p_values = prepare_df_words(file_submit_csv, test_df,
                                             out_user_id=out_user_id)
 
-    p_value_limit = .0
+    p_value_limit = .02
     uses_preds = dict()
     for user_id in p_values['pred']:
         preds = words[words.pred == user_id]
@@ -359,24 +374,37 @@ def find_predict_words2(file_submit_csv, test_df, user_id_max=60):
                 words.at[index, 'p_values'] = p_values
 
     # Для неопределенных user_id
-    fill_no_user_id = False
+    fill_no_user_id = True
     no_user_id = words[words.pred == -999]
     if fill_no_user_id and len(no_user_id):
         # print(no_user_id)
         for index, row in no_user_id.iterrows():
+            if row.user_word in ('regression', 'y'):
+                continue
             tmp = grp[grp.user_id == row.user_word]
             # print(tmp)
             time_start = tmp.time_start.min() * 0.8
             time_end = tmp.time_end.max() * 1.2
             temp = grp[
-                # (grp['first_show'] > pd.to_datetime('2022-12-01').date()) &
-                (grp['date'] < pd.to_datetime('2023-01-01').date()) &
-                ~grp.user_id.isin(words.pred.unique()) &
-                (grp.time_start > time_start) & (grp.time_end < time_end)
+                (pd.to_datetime(grp['first_show']).dt.date > pd.to_datetime(
+                    '2022-12-01').date())
+                & (pd.to_datetime(grp['date']).dt.date < pd.to_datetime('2023-01-01').date())
+                & ~grp.user_id.isin(uses_preds.keys())
+                & ~grp.user_id.isin(out_user_id)
+                & (grp.time_start > time_start) & (grp.time_end < time_end)
                 ]
+            if not len(temp):
+                temp = grp[
+                    (pd.to_datetime(grp['date']).dt.date < pd.to_datetime(
+                        '2023-01-01').date())
+                    & ~grp.user_id.isin(uses_preds.keys())
+                    & ~grp.user_id.isin(out_user_id)
+                    & (grp.time_start > time_start) & (grp.time_end < time_end)
+                    ]
             temp = temp.sort_values('first_show', ascending=False).reset_index(drop=True)
             user_id = temp.at[0, 'user_id']
             words.at[index, 'pred'] = user_id
+            no_user_id.at[index, 'pred'] = user_id
 
             # print(temp)
             df_to_excel(temp, file_dir.joinpath('grp.xlsx'))
@@ -403,6 +431,7 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
 
     out_user_id = 'auto'
     # пока зафиксируем эти user_id для удаления
+    out_user_id = [4, 5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 51, 52, 57]
     # out_user_id = [5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 57]
     # out_user_id = [4, 51, 52]
 
@@ -463,11 +492,14 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
     # print(words)
 
     # Для неопределенных user_id
-    fill_no_user_id = False
+    fill_no_user_id = True
     no_user_id = words[words.pred == -999]
     if fill_no_user_id and len(no_user_id):
         print('no_user_id:\n', no_user_id)
         for index, row in no_user_id.iterrows():
+            if row.user_word in ('regression', 'y'):
+                uses_preds[-99 + (row.user_word == 'y')] = (row.user_word, 0)
+                continue
             tmp = grp[grp.user_id == row.user_word]
             print('row.user_word:', row.user_word)
             time_start = tmp.time_start.min() * 0.8
@@ -477,6 +509,7 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
                     '2022-12-01').date())
                 & (pd.to_datetime(grp['date']).dt.date < pd.to_datetime('2023-01-01').date())
                 & ~grp.user_id.isin(uses_preds.keys())
+                & ~grp.user_id.isin(out_user_id)
                 & (grp.time_start > time_start) & (grp.time_end < time_end)
                 ]
             if not len(temp):
@@ -484,11 +517,14 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
                     (pd.to_datetime(grp['date']).dt.date < pd.to_datetime(
                         '2023-01-01').date())
                     & ~grp.user_id.isin(uses_preds.keys())
+                    & ~grp.user_id.isin(out_user_id)
                     & (grp.time_start > time_start) & (grp.time_end < time_end)
                     ]
             temp = temp.sort_values('first_show', ascending=False).reset_index(drop=True)
             user_id = temp.at[0, 'user_id']
             words.at[index, 'pred'] = user_id
+            no_user_id.at[index, 'pred'] = user_id
+
 
             # добавим найденные user_id для user_word в словарь uses_preds
             uses_preds[user_id] = (row['user_word'], row['p_value'])
@@ -500,6 +536,11 @@ def find_predict_words_new(file_submit_csv, test_df, user_id_max=60):
         wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
         df_to_excel(words, file_dir.joinpath(f'words{iteration:02}.xlsx'),
                     float_cells=[3, 5], ins_col_width=wd)
+
+    # for word in ('regression', 'y'):
+    #     if word not in uses_preds:
+    #         uses_preds[word] = -999
+    print(no_user_id)
 
     # print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
 
@@ -641,6 +682,7 @@ class DataTransform:
         self.use_catboost = use_catboost
         self.category_columns = [] if category_columns is None else category_columns
         self.numeric_columns = [] if numeric_columns is None else numeric_columns
+        self.drop_duplicates = False
         self.drop_first = drop_first
         self.exclude_columns = []
         self.new_columns = []
@@ -793,9 +835,11 @@ class DataTransform:
         idx_isna_words = df['user_word'].isna()
         df.loc[idx_isna_words, 'user_word'] = df.loc[idx_isna_words, 'user_id']
 
-        if drop_outlet_weeks:
+        if self.drop_duplicates:
             # удаление дубликатов
             df.drop_duplicates(['ts', 'gate_id', 'user_word'], inplace=True)
+
+        if drop_outlet_weeks:
             # подсчет количества посещений по неделям
             grp_week = df.groupby(['week'], as_index=False).agg(counts=('ts', 'count'))
             out_weeks = grp_week[grp_week.counts < 777].week.tolist()
@@ -1031,6 +1075,11 @@ class DataTransform:
         return index_mask >= 0
 
     def drop_outlets_user_gate(self, df):
+        """
+        Удаление user_id редко приходивших (1-2 раза) и gate_id, которых нет в тесте: 0,16
+        :param df: ДФ
+        :return: ДФ без этих user_id и gate_id
+        """
         if 'gate_id' in df.columns:
             outlet_user_gate = df.user_id.isin([4, 51, '4', '51']) | df.gate_id.isin([0, 16])
             self.comment.update(drop_users='4,51', drop_gates='0,16')
@@ -1040,13 +1089,18 @@ class DataTransform:
         return df[~outlet_user_gate]
 
     def drop_no_december_users(self, df):
+        """
+        Удаление user_id, которые не приходили в декабре
+        :param df: ДФ
+        :return: ДФ без этих user_id
+        """
         # заполнение колонки user_word на трейне значением user_id
         idx_isna_words = df['user_word'].isna()
         df.loc[idx_isna_words, 'user_word'] = df.loc[idx_isna_words, 'user_id']
 
-        grp = df.groupby(['user_word'], as_index=False).agg(last_show=('date', max))
+        grp = df.groupby(['user_word'], as_index=False).agg(last_show=('ts', max))
         grp['no_december'] = grp['last_show'].map(
-            lambda x: pd.to_datetime(x).month not in (1, 2, 12)).astype(int)
+            lambda x: x.month not in (1, 2, 12)).astype(int)
         # Убрать те user_id, которых не было в декабре
         out_user_id = grp[grp['no_december'].eq(1)].user_word.unique()
         self.comment.update(drop_december=','.join(map(str, sorted(out_user_id))))
@@ -1153,19 +1207,19 @@ class DataTransform:
 
         return df
 
-    def vectorizer_gates(self, df, gates_column, group_columns=None):
+    def vectorizer_gates(self, df_vct, gates_column, group_columns=None):
         """
         Векторизация турникетов за один день по group_columns
         или за один день по одному user_word если group_columns=None
-        :param df: исходный ДФ
+        :param df_vct: исходный ДФ
         :param gates_column: колонка с кортежем турникетов для векторизации
         :param group_columns: список колонок для группировки
         :return:
         """
         if group_columns is None:
-            grp = df
+            grp = df_vct
         else:
-            grp = df.groupby(group_columns, as_index=False).agg(
+            grp = df_vct.groupby(group_columns, as_index=False).agg(
                 list_gates_full=('gate_id', tuple),
             )
             gates_column = 'list_gates_full'
@@ -1193,8 +1247,8 @@ class DataTransform:
         if group_columns is None:
             return grp
         else:
-            df = df.merge(grp, on=group_columns, how='left')
-            return df
+            df_vct = df_vct.merge(grp, on=group_columns, how='left')
+            return df_vct
 
     def transform(self, df, model_columns=None, out_five_percent=False, drop_december=False,
                   replace_gates_full_vector=False):
@@ -1281,7 +1335,11 @@ class DataTransform:
         df_columns = [col for col in df.columns if col not in grp.columns]
         df_columns.extend(['user_word', 'date'])
 
-        df = df[df_columns].merge(grp, on=['user_word', 'date'], how='left')
+        # эта строка почему-то сбрасывает индексы
+        # df = df[df_columns].merge(grp, on=['user_word', 'date'], how='left')
+        # пришлось сделать так: сброс индексов и восстановление их
+        df = df[df_columns].reset_index().merge(grp, on=['user_word', 'date'], how='left')
+        df.set_index('index', inplace=True)
 
         # print(grp.columns)
         # df_to_excel(grp, file_dir.joinpath('user_day_beep.xlsx'), float_cells=[3, 4])
@@ -2407,12 +2465,15 @@ if __name__ == "__main__":
     numeric_columns = ['min', 'minutes', 'seconds', 'beep_count', 'beep_gate', 'row_id']
     cat_columns = ['gate_id', 'weekday', 'hour']
 
-    data_cls = DataTransform3(category_columns=cat_columns, drop_first=False,
-                              # numeric_columns=numeric_columns, scaler=StandardScaler,
-                              )
+    data_cls = DataTransform(category_columns=cat_columns, drop_first=False,
+                             # numeric_columns=numeric_columns, scaler=StandardScaler,
+                             )
     # prefix_preprocess = '_MV2'
     # data_cls.preprocess_path_file = GATES_DIR.joinpath(
     #     f'preprocess_df{prefix_preprocess}.pkl')
+
+    # удалять дубликаты
+    data_cls.drop_duplicates = True
 
     df = data_cls.initial_preparation(all_df)
 
@@ -2467,3 +2528,5 @@ if __name__ == "__main__":
     print(data_cls.comment)
 
     print(df.no_december.value_counts())
+
+    print(df.duplicated().sum())
