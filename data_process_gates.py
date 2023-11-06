@@ -141,19 +141,23 @@ class PredictWords:
         self.test_df = test_df
         self.words = None
         self.p_values = None
-        self.uses_preds = dict()
-        self.p_value_limit = 0.02
+        self.uses_preds = dict()  # сюда складываем предсказанных user_id
+        self.p_value_limit = 0.05  # нижний предел вероятности когда можно доверять
+        self.p_count_koeff = 3  # коэфф для сомнительных вероятностей
+        self.easter_eggs = {'regression': 16, 'y': 13}  # пасхалки
+        self.use_easter_eggs = False  # использовать пасхалки
+        self.use_found_words = False
 
         df = read_all_df(self.file_dir)
 
         self.dtc = DataTransform()
-
+        self.pair_p_values = self.dtc.gates_mask.copy()
         self.data_cls = DataTransform2()
         self.data_cls.drop_duplicates = True
 
         # Здесь надо повторить обработку all_df как в классификаторе:
         # - удаление дублей
-        # - турникетов 0,16
+        # - турникетов 0, 16
         # - случайных user_id 4, 51, 52
         # - тех, кто не ходил в декабре
         # - удаление дубликатов
@@ -167,23 +171,32 @@ class PredictWords:
                                                remove_double_gate=False,
                                                drop_december=True)
 
-        self.out_user_id = [4, 5, 7, 8, 20, 27, 28, 31, 38, 40, 42, 45, 47, 51, 52, 57]
+        self.user_words = [uw for uw in self.grp.user_id.unique() if str(uw)[0].isalpha()]
 
-    def prepare_df_words(self):
+        self.out_user_id = [5, 7, 8, 10, 18, 20, 27, 28, 31, 38, 40, 42, 47, 45, 57]
+        self.out_user_id.extend([4, 51, 52])
+
+    def prepare_df_words(self, debug=False):
         """
         Формирование ДФ words
+        :param debug: отображать информацию о ходе заполнения user_id
         :return: words, p_values
         """
         submit = pd.read_csv(self.file_submit_csv, index_col=0)
-        submit['user_word'] = self.test_df['user_word'].astype('object')
+        if debug:
+            print('submit.shape', submit.shape)
 
-        # print(submit)
-        # print(test_df['user_word'])
+        submit['user_word'] = self.test_df['user_word'].astype('object')
+        if debug:
+            print('submit.shape', submit.shape)
+            print('test_df.shape', self.test_df.shape)
+
+        # print("submit['user_word'].nunique()", submit['user_word'].nunique())
+        # print("self.test_df['user_word'].nunique()", self.test_df['user_word'].nunique())
         # print('user_id_max:', user_id_max)
 
-        # print('out_user_id == target')
-        # print(submit[submit['target'].isin(out_user_id)].target.value_counts())
-        # print(submit[submit['target'].isin(out_user_id)].user_word.value_counts())
+        # print(submit[submit['target'].isin(self.out_user_id)].target.value_counts())
+        # print(submit[submit['target'].isin(self.out_user_id)].user_word.value_counts())
 
         # без user_id, которых не было в декабре и редких
         words = submit[~submit.target.isin(self.out_user_id)] \
@@ -193,55 +206,90 @@ class PredictWords:
                  p_counts=('target', lambda x: x.value_counts()
                            .reset_index().values.tolist()),
                  total=('target', 'count'))
+
+        print('words:\n', words)
+
         # Заменяем колонку в датафрейме объединенными данными
         words['p_values'] = words.apply(lambda row: [(x, y, z) for (x, y), (_, z) in
                                                      zip(row['p_values'], row['p_counts'])],
                                         axis='columns')
+        # p_counts не нужна, т.к. значения добавлены в кортеж
         words.drop('p_counts', axis='columns', inplace=True)
-        words.insert(1, 'prd_v_c', 0)
-        words.insert(1, 'p_count', 0)
-        words.insert(1, 'p_value', 0)
-        words.insert(1, 'pred', -999)
-        # value_counts выдал в виде кортежа ('user_id', 'p_value'), user_id преобразуем в int
+        # value_counts выдал в виде кортежа ('user_id', 'p_value', 'p_count'),
+        # user_id преобразуем в int, p_value округлим до 5 знака
         words['p_values'] = words['p_values'].map(
-            lambda x: [*map(lambda z: (int(z[0]),) + z[1:], x)])
+            lambda x: [(int(p[0]), round(p[1] + (p[0] in (9, 23)) * .13, 5), int(p[2]))
+                       for p in x])
+        # добавим новые колонки в ДФ
+        for ins_col in ('prd_v_c', 'p_count', 'p_value', 'pred'):
+            words.insert(1, ins_col, -999 if ins_col == 'pred' else 0)
+        # сортируем кортежи в порядке убывания p_value и возрастанию user_id
         words['p_values'] = words['p_values'].map(
             lambda x: sorted(x, key=lambda k: (-k[1], k[0])))
-        # сортируем кортежи в порядке убывания p_value и возрастанию user_id
         # выделим в отдельную колонку первый pred user_id
         words['pred'] = words['p_values'].map(lambda x: x[0][0]).astype(int)
         # выделим в отдельную колонку первое p_value
         words['p_value'] = words['p_values'].map(lambda x: x[0][1])
         # выделим в отдельную колонку первое p_value
         words['p_count'] = words['p_values'].map(lambda x: x[0][2]).astype(int)
-        words['prd_v_c'] = words['p_value'] * words['p_count']
+        words['prd_v_c'] = (words['p_value'] * self.p_count_koeff +
+                            words['p_count'] / self.p_count_koeff)
         # сохраним для истории эти значения, т.к. дальше будем их затирать
         words['pred_old'] = words['pred']
         words['p_values_old'] = words['p_values']
 
-        for pair in self.dtc.gates_mask[-2:]:
-            idx1, idx2 = int(''.join(map(str, pair[:2]))), int(''.join(map(str, pair[2:])))
-            words.iloc[idx1, 1:7] = [idx2, 1, 1, 1, [(idx2, 1)], 1]
+        # Иногда не для всех слов предсказываются user_id
+        for word in set(self.user_words) - set(words.user_word.unique()):
+            if debug:
+                print('Нет предсказания для user_word:', word)
+            words.loc[len(words)] = [word, -999, 0, 0, 0, [], 0, 0, []]
+        words = words.sort_values('user_word').reset_index(drop=True)
 
         # это заглушка для двух отсутствующих в трейне юзеров 13 и 16
-        for word in ('regression', 'y'):
+        for word, idxs in self.easter_eggs.items():
+            word_numbers = [-999, 0, 0, 0, 0]
             words.loc[words.user_word.eq(word),
-                      ['pred', 'p_value', 'p_count', 'prd_v_c', 'total']
-            ] = [-999, 0, 0, 0, 0]
+                      ['pred', 'p_value', 'p_count', 'prd_v_c', 'total']] = word_numbers
+        if self.use_found_words:
+            for pr in self.pair_p_values[-2:]:
+                idx1, idx2 = int(''.join(map(str, pr[:2]))), int(''.join(map(str, pr[2:])))
+                words.iloc[idx1, 1:7] = [idx2, .345, 6, 7, [(idx2, .345, 6)], 7]
+
         words['p_values'] = words.apply(
             lambda row: [] if row.pred < 0 else row.p_values, axis=1)
 
         # преобразуем в ДФ максимальные p_value для каждого user_id
-        p_values = sum(words['p_values'].tolist(), [])
-        p_values = pd.DataFrame(p_values, columns=['pred', 'p_value', 'total'])
-        p_values = p_values.groupby('pred', as_index=False).p_value.max() \
+        values = sum(words['p_values'].tolist(), [])
+        values = pd.DataFrame(values, columns=['pred', 'p_value', 'p_count'])
+        values['prd_v_c'] = (values['p_value'] * self.p_count_koeff +
+                             values['p_count'] / self.p_count_koeff)
+        p_values = values.groupby('pred', as_index=False).p_value.max() \
+            .sort_values('p_value', ascending=False)
+        prd_v_cs = values.groupby('pred', as_index=False).prd_v_c.max() \
+            .sort_values('prd_v_c', ascending=False)
+        p_values = p_values.merge(values, on=['pred', 'p_value'], how='left')
+        prd_v_cs = prd_v_cs.merge(values, on=['pred', 'prd_v_c'], how='left')
+        p_values = pd.concat([p_values, prd_v_cs], ignore_index=True).drop_duplicates()
+        p_values = p_values[p_values.p_value.ge(self.p_value_limit)] \
             .sort_values('p_value', ascending=False)
 
-        df_to_excel(p_values, self.file_dir.joinpath('p_values.xlsx'), float_cells=[2])
-        # print(words)
-        wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
-        df_to_excel(words, self.file_dir.joinpath('words.xlsx'), float_cells=[3, 5],
-                    ins_col_width=wd)
+        if debug:
+            av = 0
+            voited = self.file_dir.joinpath('users_visits.xlsx')
+            if voited.is_file():
+                av = 1
+                td = pd.read_excel(voited, sheet_name='voited')
+                td = td[td.true.ge(0)]
+                words.insert(1, 'voited', np.NAN)
+                words = words.merge(td[['user_word', 'true']], on='user_word', how='left')
+                words.voited = words.true
+                words.drop(columns=['true'], inplace=True)
+            df_to_excel(p_values, self.file_dir.joinpath('p_values.xlsx'), float_cells=[2])
+            # print(words)
+            wd = [(0, 14)] * (7 + av) + [(5 + av, 44), (8 + av, 44)]
+            df_to_excel(words, self.file_dir.joinpath('words.xlsx'),
+                        float_cells=[3 + av, 5 + av], ins_col_width=wd)
+
         self.words = words
         self.p_values = p_values
         return words, p_values
@@ -254,14 +302,17 @@ class PredictWords:
         """
         if words is None:
             words = self.words
-        no_user_id = words[words.pred == -999]
+        no_user_id = words[words.pred < -9]
         # print(no_user_id)
         for index, row in no_user_id.iterrows():
-            if row.user_word in ('regression', 'y'):
-                self.uses_preds[-99 + (row.user_word == 'y')] = (row.user_word, 0)
+            # это заглушка для двух отсутствующих в трейне юзеров 13 и 16
+            if row.user_word in self.easter_eggs.keys() and not self.use_easter_eggs:
+                self.uses_preds[-999 + (row.user_word == 'y')] = (row.user_word, 0)
                 continue
+
             if calc_similar_dist:
-                exclude_users = list(self.uses_preds.keys())
+                # exclude_users = list(self.uses_preds.keys())
+                exclude_users = list(self.uses_preds.keys()) + self.out_user_id
                 # print('exclude_users:', sorted(exclude_users))
                 user_id = self.data_cls.calc_distance(row.user_word,
                                                       exclude_users=exclude_users)
@@ -292,18 +343,26 @@ class PredictWords:
 
             words.at[index, 'pred'] = user_id
             no_user_id.at[index, 'pred'] = user_id
-            self.uses_preds[user_id] = self.p_value_limit
 
             # добавим найденные user_id для user_word в словарь uses_preds
             self.uses_preds[user_id] = (row['user_word'], row['p_value'])
-
             self.words = words
+
+        # Если заполняем пасхалки
+        if self.use_easter_eggs:
+            for user_word, user_id in self.easter_eggs.items():
+                words.loc[words.user_word.eq(user_word), 'pred'] = user_id
+                self.uses_preds[user_id] = (user_word, 1)
+
+        self.words = words
         return words, no_user_id
 
-    def find_predict_words(self, calc_similar_dist=False):
+    def find_predict_words(self, debug=False, calc_similar_dist=False):
         """
         Процедура формирования предсказания user_id на основа самого частотного во всей массе
         предсказаний и охранение в файл xxx.tst.csv
+        :param debug: отображать информацию о ходе заполнения user_id
+        :param calc_similar_dist: Использовать новый алгоритм по минимиальному расстоянию
         :return: новый сабмит с user_word
         """
 
@@ -340,22 +399,22 @@ class PredictWords:
         # Для неопределенных user_id
         self.find_no_user_id(calc_similar_dist=calc_similar_dist)
 
-        # words.at['y', 'pred'] = 13
-        # words.at['regression', 'pred'] = 16
-
-        wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
-        df_to_excel(self.words, self.file_dir.joinpath('words.tst.xlsx'), float_cells=[3, 5],
-                    ins_col_width=wd)
+        if debug:
+            wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
+            df_to_excel(self.words, GATES_DIR.joinpath('words.tst.xlsx'), float_cells=[3, 5],
+                        ins_col_width=wd)
 
         self.words[['user_word', 'pred']].rename(columns={'pred': 'preds'}) \
             .to_csv(self.file_submit_csv.with_suffix('.words.tst.csv'), index=False)
 
         return self.words
 
-    def find_predict_words2(self, calc_similar_dist=False):
+    def find_predict_words2(self, debug=False, calc_similar_dist=False):
         """
         Процедура формирования предсказания user_id на основа самого частотного во всей массе
         предсказаний и cохранение в файл xxx.tst.csv
+        :param debug: отображать информацию о ходе заполнения user_id
+        :param calc_similar_dist: Использовать новый алгоритм по минимиальному расстоянию
         :return: новый сабмит с user_word
         """
 
@@ -392,55 +451,73 @@ class PredictWords:
         # Для неопределенных user_id
         self.find_no_user_id(calc_similar_dist=calc_similar_dist)
 
-        wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
-        df_to_excel(self.words, self.file_dir.joinpath('words.tst2.xlsx'),
-                    float_cells=[3, 5], ins_col_width=wd)
+        if debug:
+            wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
+            df_to_excel(self.words, GATES_DIR.joinpath('words.tst2.xlsx'),
+                        float_cells=[3, 5], ins_col_width=wd)
 
         self.words[['user_word', 'pred']].rename(columns={'pred': 'preds'}) \
             .to_csv(self.file_submit_csv.with_suffix('.words.tst2.csv'), index=False)
         return self.words
 
-    def find_predict_words3(self, calc_similar_dist=False):
+    def find_predict_words3(self, debug=False, calc_similar_dist=False):
         """
         Процедура формирования предсказания user_id на основа самого частотного во всей массе
         предсказаний и cохранение в файл xxx.tst.csv
+        :param debug: отображать информацию о ходе заполнения user_id
+        :param calc_similar_dist: Использовать новый алгоритм по минимиальному расстоянию
         :return: новый сабмит с user_word
         """
         iter_dir = GATES_DIR.joinpath('iterations')
 
-        words, p_values = self.prepare_df_words()
+        words, p_values = self.prepare_df_words(debug=debug)
+
+        # print('p_values\n', p_values)
 
         self.uses_preds = dict()  # словарь для хранения обработанных user_id для user_word
         iteration = 0  # порядковый номер итерации
         prev_len_words = 0
         df_pv_iter = pd.DataFrame()
         while len(words) and prev_len_words != len(words) and len(p_values):
-            iteration += 1
+
+            words['prd_v_c'] = (words['p_value'] * self.p_count_koeff +
+                                words['p_count'] / self.p_count_koeff)
+
             df_pv = p_values.merge(words[['user_word', 'pred', 'p_value']],
                                    on=['pred', 'p_value'], how='left')
-            # print(df_pv)
+            # print('df_pv\n', df_pv)
 
             index_max_p_value = df_pv['p_value'].idxmax()
             row_max_p = df_pv.loc[index_max_p_value]
 
+            # Если попались несколько вероятностей для одного user_id ->
+            # возьмем с большим prd_v_c (не сработало - закомментарил)
+            dbl = df_pv[df_pv.pred == row_max_p.pred].sort_values('p_value', ascending=False)
+            if len(dbl) > 1:
+                if debug:
+                    print(f'index_max_p_value old: {index_max_p_value}')
+                index_max_p_value = dbl['prd_v_c'].idxmax()
+                # row_max_p = dbl.loc[index_max_p_value]
+                if debug:
+                    print(f'index_max_p_value new: {index_max_p_value} dbl:\n', dbl)
+
+            iteration += 1
             # запишем в ДФ найденные user_id для user_word
             pv = df_pv.dropna()
             pv.insert(0, 'iteration', iteration)
             df_pv_iter = df_pv_iter.append(row_max_p, ignore_index=True)
-            df_to_excel(pv.sort_values('p_value', ascending=False),
-                        iter_dir.joinpath(f'pv{iteration:02}.xlsx'), float_cells=[3])
+            if debug:
+                df_to_excel(pv.sort_values('p_value', ascending=False),
+                            iter_dir.joinpath(f'pv{iteration:02}.xlsx'), float_cells=[3])
 
-            # преобразуем ДФ в словарь
-            pv_dict = {row_max_p['pred']: (row_max_p['user_word'], row_max_p['p_value'])}
             # добавим найденные user_id для user_word в словарь uses_preds обработанных id
             self.uses_preds[row_max_p['pred']] = (row_max_p['user_word'],
                                                   row_max_p['p_value'])
-
-            print(f"iteration:{iteration:2} pred: {row_max_p['pred']} "
-                  f"{(row_max_p['user_word'], row_max_p['p_value'])}")
+            if debug:
+                print(f"iteration:{iteration:2} pred: {row_max_p['pred']} "
+                      f"{(row_max_p['user_word'], row_max_p['p_value'])}")
 
             # print('self.uses_preds:', sorted(self.uses_preds))
-            # print(sorted(pv_word), sorted(pv_dict.keys()), sep='\n')
 
             prev_len_words = len(words)
 
@@ -452,21 +529,38 @@ class PredictWords:
                 lambda x: [(k, *v) for k, *v in x if k not in self.uses_preds])
             # запишем в 'pred' следующий user_id по порядку, если список пуст -> -999
             words['pred'] = words['p_values'].apply(
-                lambda x: x[0][0] if len(x) > 0 else -999)
-            # запишем в 'pred' следующую вероятность по порядку, если список пуст -> 0
+                lambda x: x[0][0] if len(x) > 0 and x[0][1] >= self.p_value_limit else -999)
+            # запишем в 'p_value' следующую вероятность по порядку, если список пуст -> 0
             words['p_value'] = words['p_values'].apply(
-                lambda x: x[0][1] if len(x) > 0 else 0)
+                lambda x: x[0][1] if len(x) > 0 and x[0][1] >= self.p_value_limit else 0)
+            # запишем в 'p_count' следующее количество по порядку, если список пуст -> 0
+            words['p_count'] = words['p_values'].apply(
+                lambda x: x[0][2] if len(x) > 0 and x[0][1] >= self.p_value_limit else 0)
             # теперь надо повторить действия с "запишем в ДФ найденные user_id для user_word"
+            if debug:
+                wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
+                df_to_excel(words, iter_dir.joinpath(f'words{iteration:02}.xlsx'),
+                            float_cells=[3, 5], ins_col_width=wd)
 
-            wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
-            df_to_excel(words, iter_dir.joinpath(f'words{iteration:02}.xlsx'),
-                        float_cells=[3, 5], ins_col_width=wd)
+            values = words[words.pred.gt(-9)][['pred', 'p_value', 'p_count']]
+            values['prd_v_c'] = (values['p_value'] * self.p_count_koeff +
+                                 values['p_count'] / self.p_count_koeff)
+            p_values = values.groupby('pred', as_index=False).p_value.max() \
+                .sort_values('p_value', ascending=False)
+            prd_v_cs = values.groupby('pred', as_index=False).prd_v_c.max() \
+                .sort_values('prd_v_c', ascending=False)
+            p_values = p_values.merge(values, on=['pred', 'p_value'], how='left')
+            prd_v_cs = prd_v_cs.merge(values, on=['pred', 'prd_v_c'], how='left')
+            p_values = pd.concat([p_values, prd_v_cs], ignore_index=True).drop_duplicates()
+            p_values = p_values[p_values.p_value.ge(self.p_value_limit)] \
+                .sort_values('p_value', ascending=False)
 
-            p_values = words[words.pred.gt(-9)].groupby('pred', as_index=False).p_value.max()
+        if debug:
+            df_to_excel(df_pv_iter, iter_dir.joinpath('df_pv_iter.xlsx'), float_cells=[3])
+            # print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
+            # print(words)
 
-        df_to_excel(df_pv_iter, iter_dir.joinpath('df_pv_iter.xlsx'), float_cells=[3])
-        # print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
-        # print(words)
+        # print(words.drop(columns=['p_values_old', 'pred_old', 'p_values']))
 
         # Для неопределенных user_id
         fill_no_user_id = True
@@ -474,37 +568,41 @@ class PredictWords:
             words, no_user_id = self.find_no_user_id(words,
                                                      calc_similar_dist=calc_similar_dist)
         else:
-            no_user_id = words[words.pred == -999]
+            no_user_id = words[words.pred < -9]
 
         iteration += 1
-        wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
-        df_to_excel(words, iter_dir.joinpath(f'words{iteration:02}.xlsx'),
-                    float_cells=[3, 5], ins_col_width=wd)
 
-        # for word in ('regression', 'y'):
-        #     if word not in uses_preds:
-        #         uses_preds[word] = -999
-        print(no_user_id)
+        if debug:
+            wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
+            df_to_excel(words, iter_dir.joinpath(f'words{iteration:02}.xlsx'),
+                        float_cells=[3, 5], ins_col_width=wd)
+
+            print('find_no_user_id --> user_word, pred:')
+            print(no_user_id.drop(columns=['p_values_old', 'pred_old', 'p_values']))
 
         # print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
 
         new_words = {val[0]: key for key, val in self.uses_preds.items()}
-        new_words = pd.DataFrame(sorted(new_words.items()), columns=['user_word', 'preds'])
+        new_words = pd.DataFrame(new_words.items(), columns=['user_word', 'preds'])
         # print(new_words)
 
         if not fill_no_user_id and len(no_user_id):
             no_user_id = no_user_id.rename(columns={'pred': 'preds'})
             new_words = pd.concat([new_words, no_user_id[['user_word', 'preds']]])
-            new_words.sort_values('user_word', inplace=True)
 
+        # сохранение предсказаний в файл
+        new_words.sort_values('user_word', inplace=True)
         new_words.to_csv(self.file_submit_csv.with_suffix('.words.tst3.csv'), index=False)
+
         return self.words
 
-    def find_predict_words_new(self, calc_similar_dist=False):
+    def find_predict_words_new(self, debug=False, calc_similar_dist=False):
         """
         Новая версия с удалением дублей user_id в сабмите
         Процедура формирования предсказания user_id на основа самого частотного во всей массе
-        предсказаний и исключение дублей user_id для разных слов и сохранение в файл xxx.tst.csv
+        предсказаний и исключение дублей user_id для разных слов и запись в файл xxx.tst.csv
+        :param debug: отображать информацию о ходе заполнения user_id
+        :param calc_similar_dist: Использовать новый алгоритм по минимиальному расстоянию
         :return: новый сабмит с user_word
         """
         iter_dir = PREDICTIONS_DIR.joinpath('iterations')
@@ -526,8 +624,9 @@ class PredictWords:
             pv = df_pv.dropna()
             pv.insert(0, 'iteration', iteration)
             df_pv_iter = pd.concat([df_pv_iter, pv.sort_values('user_word')])
-            df_to_excel(pv.sort_values('user_word'),
-                        iter_dir.joinpath(f'pv{iteration:02}.xlsx'), float_cells=[3])
+            if debug:
+                df_to_excel(pv.sort_values('user_word'),
+                            iter_dir.joinpath(f'pv{iteration:02}.xlsx'), float_cells=[3])
             # преобразуем ДФ в словарь
             pv_dict = {row['pred']: (row['user_word'], row['p_value']) for _, row in
                        pv.iterrows()}
@@ -553,20 +652,21 @@ class PredictWords:
             words['p_value'] = words['p_values'].apply(
                 lambda x: x[0][1] if len(x) > 0 else 0)
             # теперь надо повторить действия с "запишем в ДФ найденные user_id для user_word"
+            if debug:
+                wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
+                df_to_excel(words, iter_dir.joinpath(f'words{iteration:02}.xlsx'),
+                            float_cells=[3, 5], ins_col_width=wd)
 
-            wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
-            df_to_excel(words, iter_dir.joinpath(f'words{iteration:02}.xlsx'),
-                        float_cells=[3, 5], ins_col_width=wd)
             user_pred = set(words['pred'].tolist())
             if prev_user_pred == user_pred:
                 p_values = words[words.pred.gt(-9)].groupby('pred',
                                                             as_index=False).p_value.max()
                 # print('p_values по новому алгоритму:\n', p_values)
                 prev_user_pred = set()
-
-        df_to_excel(df_pv_iter, iter_dir.joinpath('df_pv_iter.xlsx'), float_cells=[3])
-        # print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
-        # print(words)
+        if debug:
+            df_to_excel(df_pv_iter, iter_dir.joinpath('df_pv_iter.xlsx'), float_cells=[3])
+            # print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
+            # print(words)
 
         # Для неопределенных user_id
         fill_no_user_id = True
@@ -574,17 +674,15 @@ class PredictWords:
             words, no_user_id = self.find_no_user_id(words,
                                                      calc_similar_dist=calc_similar_dist)
         else:
-            no_user_id = words[words.pred == -999]
+            no_user_id = words[words.pred < -9]
 
         iteration += 1
-        wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
-        df_to_excel(words, iter_dir.joinpath(f'words{iteration:02}.xlsx'),
-                    float_cells=[3, 5], ins_col_width=wd)
 
-        # for word in ('regression', 'y'):
-        #     if word not in uses_preds:
-        #         uses_preds[word] = -999
-        print(no_user_id)
+        if debug:
+            wd = [(0, 14)] * 7 + [(5, 44), (8, 44)]
+            df_to_excel(words, iter_dir.joinpath(f'words{iteration:02}.xlsx'),
+                        float_cells=[3, 5], ins_col_width=wd)
+            print(no_user_id)
 
         # print('Длина uses_preds:', len(uses_preds), uses_preds, sep='\n')
 
@@ -595,8 +693,8 @@ class PredictWords:
         if not fill_no_user_id and len(no_user_id):
             no_user_id = no_user_id.rename(columns={'pred': 'preds'})
             new_words = pd.concat([new_words, no_user_id[['user_word', 'preds']]])
-            new_words.sort_values('user_word', inplace=True)
 
+        new_words.sort_values('user_word', inplace=True)
         new_words.to_csv(self.file_submit_csv.with_suffix('.words.tst_new.csv'), index=False)
         return words
 
@@ -679,7 +777,7 @@ def predict_test(idx_fold, model, datasets, max_num=0, submit_prefix='lg_', labe
         words.to_csv(file_submit_csv.with_suffix('.words.csv'), index=False)
 
         words_obj = PredictWords(file_submit_csv, test_df, target.max())
-        words_obj.find_predict_words()
+        words_obj.find_predict_words3(calc_similar_dist=True)
         # words_obj.find_predict_words_new()
 
     except IndexError:
@@ -760,10 +858,10 @@ class DataTransform:
                            (11, 6, 6), (11, 6, 6, 5), (11, 6, 6, 6), (11, 6, 6, 9, 9),
                            (11, 10, 11), (11, 10, 11, 4), (11, 11, 4, 4), (11, 11, 4, 4, 9),
                            (11, 11, 10), (12, 12, 11), (12, 12, 11, 4), (13, 13, 4, 4),
-                           (13, 13, 6, 6), (13, 13, 10), (13, 13, 11), (13, 13, 12, 12),
-                           (13, 13, 12, 12, 11), (15, 3, 3), (15, 3, 3, 10),
-                           (15, 3, 3, 10, 11), (15, 9, 9), (15, 9, 9, 5, 5), (3, 0, 4, 6),
-                           (0, 6, 0, 0), (2, 6, 2, 1),
+                           (13, 13, 6, 6), (13, 13, 10), (13, 13, 11), (13, 13, 12, 12, 11),
+                           (13, 13, 12, 12), (15, 3, 3, 10), (15, 3, 3, 10, 11), (15, 3, 3),
+                           (15, 9, 9), (15, 9, 9, 5, 5),
+                           (0, 5, 2, 3), (2, 6, 2, 1), (1, 1, 4, 4),
                            ]
         self.gates_M_V2 = [(-1, -1, -1), (-1, -1, -1, -1), (-1, -1, 10), (-1, -1, 11),
                            (3, 3, 4), (3, 3, 10), (3, 3, 10, 11), (3, 3, 10, 11, 4),
@@ -1149,8 +1247,8 @@ class DataTransform:
             lambda x: x.month not in (1, 2, 12)).astype(int)
         # Убрать те user_id, которых не было в декабре
         out_user_id = grp[grp['no_december'].eq(1)].user_word.unique().tolist()
-        out_user_id.append(47)
-        print('out_user_id:', sorted(out_user_id))
+        out_user_id.extend([18, 22, 26, 34, 47])
+        # print('out_user_id:', sorted(out_user_id))
         self.comment.update(drop_december=','.join(map(str, sorted(out_user_id))))
         self.out_user_id = sorted(out_user_id)
         df = df[~df.user_word.isin(out_user_id)]
@@ -1332,11 +1430,13 @@ class DataTransform:
         # grp['user_day_median'] = grp.groupby('user_word').user_day_beep.transform('median')
         new_cols = []
         for name_col in ('user_day_beep', 'time_start', 'time_end', 'time_delta'):
-            for grp_func in ('mean', 'median'):
+            for grp_func in ('mean', 'std', 'median'):
                 grp_col = f'{name_col}_{grp_func}'
                 grp[grp_col] = grp.groupby('user_word')[name_col].transform(grp_func)
+                grp[grp_col].fillna(0, inplace=True)
                 new_cols.append(grp_col)
-        # print(new_cols)
+        # print('new_cols:', new_cols)
+        # print(grp[new_cols].isna().sum())
 
         # счетчик: сколько и каких турникетов было пройдено за день
         grp['counter'] = grp['list_gates_full'].map(Counter)
@@ -1521,11 +1621,12 @@ class DataTransform:
                             )
         return df
 
-    def train_test_split(self, df, y=None, *args, **kwargs):
+    def train_test_split(self, df, y=None, drop_outlets=False, *args, **kwargs):
         """
         Деление на обучающую и валидационную выборки
         :param df: ДФ
         :param y: целевая переменная
+        :param drop_outlets: удалить редких юзеров и гейты
         :param args: аргументы
         :param kwargs: именованные аргументы
         :return: x_train, x_valid, y_train, y_valid
@@ -1557,6 +1658,19 @@ class DataTransform:
 
             self.comment.update(train_months=self.train_months,
                                 valid_months=self.valid_months)
+
+        if drop_outlets:
+            if 'gate_id' in df.columns:
+                outlet_user_gate = df.user_id.isin([4, 51]) | df.gate_id.isin([0, 16])
+                self.comment.update(drop_users='4,51', drop_gates='0,16')
+            else:
+                outlet_user_gate = df.user_id.isin([4, 51])
+                self.comment.update(drop_users='4,51')
+            outlet_index = df[outlet_user_gate].index
+            x_train = x_train[~x_train.index.isin(outlet_index)]
+            x_valid = x_valid[~x_valid.index.isin(outlet_index)]
+            y_train = y_train[~y_train.index.isin(outlet_index)]
+            y_valid = y_valid[~y_valid.index.isin(outlet_index)]
 
         return x_train, x_valid, y_train, y_valid
 
@@ -2486,6 +2600,18 @@ class DataTransform2(DataTransform):
                     df[mask_col] = df['counter'].map(lambda x: x.get(gate, 0))
                     self.numeric_columns.append(mask_col)
 
+        if self.vectorizer is not None and 'vectorizer' not in self.exclude_columns:
+            if self.group_before_vectorizer is None:
+                # векторизация турникетов за один день по одному user_word
+                df = self.vectorizer_gates(df, 'list_gates_full')
+            else:
+                if isinstance(self.group_before_vectorizer, str):
+                    grp_cols = [self.group_before_vectorizer]
+                else:
+                    grp_cols = self.group_before_vectorizer
+                # векторизация турникетов за один день по всем user_id - такая карта дня
+                df = self.vectorizer_gates(df, 'list_gates_full', grp_cols)
+
         if model_columns is None:
             model_columns = df.columns.to_list()
 
@@ -2517,7 +2643,7 @@ class DataTransform2(DataTransform):
         df = memory_compression(df, exclude_columns=['counter'])
 
         wd = [(0, 12)] * len(df.columns)
-        df_to_excel(df, self.file_dir.joinpath('df_to_model.xlsx'), ins_col_width=wd)
+        # df_to_excel(df, self.file_dir.joinpath('df_to_model.xlsx'), ins_col_width=wd)
 
         return df
 
@@ -2703,23 +2829,34 @@ if __name__ == "__main__":
 
     df = read_all_df(file_dir)
 
-    data_cls = DataTransform2()
-    data_cls.drop_duplicates = True
+    # data_cls = DataTransform2()
+    # data_cls.drop_duplicates = True
+    #
+    # # Здесь надо повторить обработку all_df как в классификаторе:
+    # # - удаление дублей
+    # # - турникетов 0,16
+    # # - случайных user_id 4, 51, 52
+    # # - тех, кто не ходил в декабре
+    # # - удаление дубликатов
+    # # - удаление неполноценных недель
+    #
+    # df = data_cls.initial_preparation(df, drop_outlet_weeks=True)
+    # df = data_cls.drop_outlets_user_gate(df)
+    # # df = data_cls.drop_no_december_users(df)
+    # ############################################################
+    #
+    # grp = data_cls.fit_days_mask(df, show_messages=False,
+    #                              remove_double_gate=False,
+    #                              drop_december=True)
+    # print(sorted(data_cls.out_user_id + [4, 51]))
 
-    # Здесь надо повторить обработку all_df как в классификаторе:
-    # - удаление дублей
-    # - турникетов 0,16
-    # - случайных user_id 4, 51, 52
-    # - тех, кто не ходил в декабре
-    # - удаление дубликатов
-    # - удаление неполноценных недель
+    words_obj = PredictWords('', df)
+    print(sorted(words_obj.out_user_id))
 
-    df = data_cls.initial_preparation(df, drop_outlet_weeks=True)
-    df = data_cls.drop_outlets_user_gate(df)
-    # df = data_cls.drop_no_december_users(df)
-    ############################################################
+    td = pd.read_excel(file_dir.joinpath('users_visits.xlsx'), sheet_name='voited')
+    used_id = sorted(td[td.true.ge(0)].true.values)
+    print(used_id)
 
-    grp = data_cls.fit_days_mask(df, show_messages=False,
-                                 remove_double_gate=False,
-                                 drop_december=True)
-    print(sorted(data_cls.out_user_id + [4, 51]))
+    free_id = set(range(58)) - set(words_obj.out_user_id) - set(used_id)
+    print(sorted(free_id))
+    print(sorted(td[td.true.lt(0)].user_word.values))
