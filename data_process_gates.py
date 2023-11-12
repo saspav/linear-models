@@ -206,8 +206,8 @@ class PredictWords:
                  p_counts=('target', lambda x: x.value_counts()
                            .reset_index().values.tolist()),
                  total=('target', 'count'))
-
-        print('words:\n', words)
+        if debug:
+            print('words:\n', words)
 
         # Заменяем колонку в датафрейме объединенными данными
         words['p_values'] = words.apply(lambda row: [(x, y, z) for (x, y), (_, z) in
