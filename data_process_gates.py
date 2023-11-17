@@ -412,7 +412,7 @@ class PredictWords:
     def find_predict_words2(self, debug=False, calc_similar_dist=False):
         """
         Процедура формирования предсказания user_id на основа самого частотного во всей массе
-        предсказаний и cохранение в файл xxx.tst.csv
+        предсказаний и cохранение в файл xxx.tst2.csv
         :param debug: отображать информацию о ходе заполнения user_id
         :param calc_similar_dist: Использовать новый алгоритм по минимиальному расстоянию
         :return: новый сабмит с user_word
@@ -463,7 +463,7 @@ class PredictWords:
     def find_predict_words3(self, debug=False, calc_similar_dist=False):
         """
         Процедура формирования предсказания user_id на основа самого частотного во всей массе
-        предсказаний и cохранение в файл xxx.tst.csv
+        предсказаний и cохранение в файл xxx.tst3.csv
         :param debug: отображать информацию о ходе заполнения user_id
         :param calc_similar_dist: Использовать новый алгоритм по минимиальному расстоянию
         :return: новый сабмит с user_word
@@ -590,9 +590,16 @@ class PredictWords:
             no_user_id = no_user_id.rename(columns={'pred': 'preds'})
             new_words = pd.concat([new_words, no_user_id[['user_word', 'preds']]])
 
+        pf = ''
+        if self.use_found_words:
+            pf += '_ufw'
+        if self.use_easter_eggs:
+            pf += '_egg'
+
         # сохранение предсказаний в файл
         new_words.sort_values('user_word', inplace=True)
-        new_words.to_csv(self.file_submit_csv.with_suffix('.words.tst3.csv'), index=False)
+        new_words.to_csv(self.file_submit_csv.with_suffix(f'.words.tst3{pf}.csv'),
+                         index=False)
 
         return self.words
 
@@ -600,7 +607,7 @@ class PredictWords:
         """
         Новая версия с удалением дублей user_id в сабмите
         Процедура формирования предсказания user_id на основа самого частотного во всей массе
-        предсказаний и исключение дублей user_id для разных слов и запись в файл xxx.tst.csv
+        предсказаний и исключение дублей user_id для разных слов в файл xxx.tst_new.csv
         :param debug: отображать информацию о ходе заполнения user_id
         :param calc_similar_dist: Использовать новый алгоритм по минимиальному расстоянию
         :return: новый сабмит с user_word
@@ -1737,6 +1744,7 @@ class DataTransform2(DataTransform):
         # что-то вроде эмбеддинга для пользователей
         self.user_embedding = None
         self.add_embeddings = False
+        self.debug = False
 
     @staticmethod
     def almost_equal(mask1, mask2, compare_first=2, last_different=True,
@@ -1990,7 +1998,8 @@ class DataTransform2(DataTransform):
         mapping = mapping.explode('gates')
         mapping.insert(3, 'len_gates', mapping['gates'].map(len))
         # mapping['len_gates'] = mapping['gates'].map(len)
-        df_to_excel(mapping, self.file_dir.joinpath(f'mapping.xlsx'))
+        if self.debug:
+            df_to_excel(mapping, self.file_dir.joinpath(f'mapping.xlsx'))
 
         mapping_dict = mapping.drop_duplicates('gates', keep='last').set_index('gates')[
             'mask'].to_dict()
@@ -2043,20 +2052,18 @@ class DataTransform2(DataTransform):
         almost_equal_masks = almost_equal_masks.merge(
             gvc[['gates', 'counts']].drop_duplicates(), on='gates', how='left')
 
-        df_to_excel(almost_equal_masks.drop_duplicates().sort_values('gates'),
-                    self.file_dir.joinpath('almost_equal_masks.xlsx'))
+        if self.debug:
+            df_to_excel(almost_equal_masks.drop_duplicates().sort_values('gates'),
+                        self.file_dir.joinpath('almost_equal_masks.xlsx'))
 
-        df_to_excel(gvc, self.file_dir.joinpath(f'gate_val_cnt{double_gate}.xlsx'))
-
-        # return grp
-        # exit()
+            df_to_excel(gvc, self.file_dir.joinpath(f'gate_val_cnt{double_gate}.xlsx'))
 
         # маски турникетов, которые встречаются 5 и более раз
         gvc = self.update_info(gvc, 'cnt_use_gates')
         if show_messages:
             print(f'Новый self.gates_mask:  {len(self.gates_mask)} элементов')
-
-        df_to_excel(gvc, self.file_dir.joinpath(f'gate_value_counts{double_gate}.xlsx'))
+        if self.debug:
+            df_to_excel(gvc, self.file_dir.joinpath(f'gate_value_counts{double_gate}.xlsx'))
 
         df_columns = ['user_id', 'date', 'week', 'month', '1day', '2day', 'last_day-1',
                       'last_day', 'weekday', 'is_weekend', 'DofY1', 'DofY2', 'user_word']
@@ -2292,10 +2299,12 @@ class DataTransform2(DataTransform):
         dfg = dfg.merge(self.gate_value_counts[gvc_columns], on='list_gates', how='left')
 
         dfg.sort_values(['user_id', 'gates', 'list_gates'], inplace=True)
-        df_to_excel(dfg, self.file_dir.joinpath('user_gates.xlsx'))
+        if self.debug:
+            df_to_excel(dfg, self.file_dir.joinpath('user_gates.xlsx'))
 
         dfg = dfg.sort_values(['gates', 'list_gates', 'user_id']).reset_index(drop=True)
-        df_to_excel(dfg, self.file_dir.joinpath('gate_users.xlsx'))
+        if self.debug:
+            df_to_excel(dfg, self.file_dir.joinpath('gate_users.xlsx'))
 
         add_len = self.add_num_for_gates_full
         if self.max_gates_len:
@@ -2331,8 +2340,8 @@ class DataTransform2(DataTransform):
             dfg = self.update_gates(dfg, mapping_dict, len_mask)
 
         print('gates_mask:', len(set(self.gates_mask) | set(self.new_found_sequences)))
-
-        df_to_excel(dfg, self.file_dir.joinpath('dfg.xlsx'))
+        if debug:
+            df_to_excel(dfg, self.file_dir.joinpath('dfg.xlsx'))
         #
         # ОПЫТЫ с этой частью кода ведутся в tst_mask.py !!!
         #
